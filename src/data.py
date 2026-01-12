@@ -34,7 +34,7 @@ class BaseDataset(Dataset):
                 Defaults to None which includes the entire dataset.
         """
         columns = ["Eye ID", "Final Label"]
-        df = df[columns] # drop all unspecified columns
+        df = df[columns].copy() # drop all unspecified columns
         df["path"] = df["Eye ID"] \
             .map(lambda id: os.path.join(data_dir, str(self._get_folder(id)), f"{id}.JPG"))
         df = df[df["path"].map(os.path.exists)] # filter if image exists
@@ -336,8 +336,8 @@ class DataModule:
         return train, val, test, real
 
     def _split_dataframes(self, df: pd.DataFrame, val_ratio: float, test_ratio: float) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        pos_df = df[df['label'] == 1]
-        neg_df = df[df['label'] == 0]
+        pos_df = df[df['Final Label'] == "RG"]
+        neg_df = df[df['Final Label'] != "RG"]
         pos_df = pos_df.sample(frac=1, random_state=self.seed)
         neg_df = neg_df.sample(frac=1, random_state=self.seed)
 
