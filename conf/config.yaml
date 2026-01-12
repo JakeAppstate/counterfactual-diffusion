@@ -1,14 +1,10 @@
-dataset:
-  data_module:
-    _target_: src.data.DataModule
-    csv_path: data/labels.csv
-    data_path: data/
-    yolo_path: yolo.torchscript
-    resize_size: 2000
-    target_size: 512
-    yolo_size: 640
-    seed: 7
-    is_precomputed: false
-  val_ratio: 0.2
-  test_ratio: 0.2
+defaults:
+  - dataset: justRAIGS
+  - _self_
+  - override hydra/hydra_logging: disabled
+  - override hydra/job_logging: disabled
+hydra:
+  run:
+    dir: .
+
 
