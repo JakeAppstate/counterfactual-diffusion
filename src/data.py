@@ -238,6 +238,7 @@ class RawDataset(BaseDataset):
         label = label.to(self.device)
         img = self._get_croped_roi(img)
         img = v2.functional.to_dtype(img, torch.float32, scale=True)
+        img = img * 2 - 1.0 # scale to [-1, 1]
         # TODO apply any processning that occurs after cropping such as scaling
         return img, label
 
