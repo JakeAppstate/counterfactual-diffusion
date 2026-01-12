@@ -213,7 +213,7 @@ class RawDataset(BaseDataset):
         """
         img_path = self.df["path"].iloc[idx]
         img = self._preprocess(img_path)
-        label = self.df["label"].iloc[idx]
+        label = torch.tensor(self.df["label"].iloc[idx])
         # TODO may need to change to a dictionary depending on training
         return img, label
     
@@ -236,9 +236,10 @@ class RawDataset(BaseDataset):
         img, label = super().collate_fn(batch)
         img = img.to(self.device)
         label = label.to(self.device)
-        cropped_img = self._get_croped_roi(img)
+        img = self._get_croped_roi(img)
+        img = v2.functional.to_dtype(img, torch.float32, scale=True)
         # TODO apply any processning that occurs after cropping such as scaling
-        return cropped_img, label
+        return img, label
 
     def _preprocess(self, img_path: str):
         """Preprocesses the image by
@@ -289,16 +290,16 @@ class RawDataset(BaseDataset):
         target_w, target_h = self.target_size
         # convert center x y to top left
         left = x - 0.5 * target_w
-        left = torch.clamp(min=0).int()
+        left = torch.clamp(left, min=0).int()
         top = y - 0.5 * target_h
-        top = torch.clamp(min=0).int()
-        
+        top = torch.clamp(top, min=0).int()
+
         # crop each at top left
         cropped_images = []
-        for i in range(len(output.size(0))):
-            img = v2.functional.crop(images[i], top.item(), left.item(), target_w, target_h)
+        for i in range(output.size(0)):
+            img = v2.functional.crop(images[i], top[i], left[i], target_w, target_h)
             cropped_images.append(img)
-        return torch.stack(cropped_images)
+        return torch.stack(cropped_images).to(torch.uint8)
 
 class PrecomputedDataset(BaseDataset):
     pass

@@ -1,5 +1,7 @@
 import hydra
-from omegaconf import DictConfig, OmegaConf
+from torch.utils.data import DataLoader
+from torchvision.utils import save_image
+from omegaconf import DictConfig
 
 @hydra.main(config_path="../conf", config_name="config", version_base=None)
 def main(cfg: DictConfig):
@@ -10,6 +12,11 @@ def main(cfg: DictConfig):
     print(f"Validation set size: {len(val)}")
     print(f"Test set size: {len(test)}")
     print(f"Real set size: {len(real)}")
+    train_dataloader = DataLoader(train, batch_size=2, shuffle=True, collate_fn=train.collate_fn)
+    x, y = next(iter(train_dataloader))
+    print(f"Sample batch x shape: {x.shape}, y shape: {y.shape}")
+    for i in range(x.size(0)):
+        save_image(x[i], f"sample_image_{i}_label_{y[i].item()}.png")
 
 if __name__ == "__main__":
     main() # pylint: disable=no-value-for-parameter
