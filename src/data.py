@@ -1,5 +1,5 @@
 # pylint: disable=import-error; pyright: reportMissingImports=false
-from typing import Tuple, Union
+from typing import Tuple, Union, Optional
 import os
 import re
 import cv2
@@ -316,26 +316,29 @@ class DataModule:
         self.is_precomputed = is_precomputed
         self.n_sample = n_sample if isinstance(n_sample, tuple) or n_sample is None else (n_sample,) * 4
 
-    def load_datasets(self, val_ratio: float = 0.2, test_ratio: float = 0.2) -> Tuple[BaseDataset, BaseDataset, BaseDataset]:
+    def load_datasets(self, val_ratio: float = 0.2, test_ratio: float = 0.2, include_real: bool = True) -> Tuple[BaseDataset, BaseDataset, BaseDataset, Optional[BaseDataset]]:
         df = pd.read_csv(self.csv_path, sep=';')
-        train_df, val_df, test_df, real_df = self._split_dataframes(df, val_ratio, test_ratio)
+        train_df, val_df, test_df, real_df = self._split_dataframes(df, val_ratio, test_ratio, include_real)
         if self.n_sample is not None:
             n1 , n2 , n3 , n4  = self.n_sample
             train_df = train_df.sample(n=n1, random_state=self.seed)
             val_df = val_df.sample(n=n2, random_state=self.seed)
             test_df = test_df.sample(n=n3, random_state=self.seed)
-            real_df = real_df.sample(n=n4, random_state=self.seed)
+            if include_real:
+                real_df = real_df.sample(n=n4, random_state=self.seed)
         if self.is_precomputed:
             raise NotImplementedError("TODO: Implement PrecomputedDataset")
         else:
             train = RawDataset(self.resize_size, self.yolo_size, self.target_size, train_df, self.data_path, self.yolo_path)
             val = RawDataset(self.resize_size, self.yolo_size, self.target_size, val_df, self.data_path, self.yolo_path)
             test = RawDataset(self.resize_size, self.yolo_size, self.target_size, test_df, self.data_path, self.yolo_path)
-            real = RawDataset(self.resize_size, self.yolo_size, self.target_size, real_df, self.data_path, self.yolo_path)
-
+            if include_real:
+                real = RawDataset(self.resize_size, self.yolo_size, self.target_size, real_df, self.data_path, self.yolo_path)
+            else: real = None
+        # pylint: disable=possibly-used-before-assignment
         return train, val, test, real
 
-    def _split_dataframes(self, df: pd.DataFrame, val_ratio: float, test_ratio: float) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    def _split_dataframes(self, df: pd.DataFrame, val_ratio: float, test_ratio: float, include_real: bool) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame]]:
         pos_df = df[df['Final Label'] == "RG"]
         neg_df = df[df['Final Label'] != "RG"]
         pos_df = pos_df.sample(frac=1, random_state=self.seed)
@@ -345,6 +348,8 @@ class DataModule:
         n_pos_val = int(len(pos_df) * val_ratio)
         n_pos_test = int(len(pos_df) * test_ratio)
         n_neg_real = int(n_pos_test / n_pos * n_neg)
+        if not include_real:
+            n_neg_real = 0
 
         # ds = [*test, *val, *train]
         pos_test = pos_df.iloc[:n_pos_test]
@@ -358,7 +363,10 @@ class DataModule:
         train = pd.concat([pos_train, neg_train]).sample(frac=1, random_state=self.seed)
         val = pd.concat([pos_val, neg_val]).sample(frac=1, random_state=self.seed)
         test = pd.concat([pos_test, neg_test]).sample(frac=1, random_state=self.seed)
-        real = pd.concat([pos_test, neg_real]).sample(frac=1, random_state=self.seed)
+        if include_real:
+            real = pd.concat([pos_test, neg_real]).sample(frac=1, random_state=self.seed)
+        else:
+            real = None
 
         return train, val, test, real
 

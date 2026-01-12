@@ -6,7 +6,8 @@ data_module:
   resize_size: 2000
   target_size: 512
   yolo_size: 640
-  seed: 7
+  seed: ${seed}
   is_precomputed: false
 val_ratio: 0.2
 test_ratio: 0.2
+include_real: true
