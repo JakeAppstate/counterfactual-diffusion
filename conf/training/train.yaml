@@ -1,0 +1,19 @@
+scheduler:
+  _target_: diffusers.DDPMScheduler
+  num_train_timesteps: 1000
+  # from StableDiffusion which what the architecture is based on
+  beta_start: 0.00085
+  beta_end: 0.012
+  beta_schedule: "scaled_linear"
+  clip_sample: false
+  prediction_type: "epsilon"
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1e-4
+  weight_decay: 0.01
+train_loop:
+  epochs: 100
+  batch_size: 64
+  mixed_precision: "bf16"
+  num_workers: 8
+  p_label_dropout: 0.3

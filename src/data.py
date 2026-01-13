@@ -1,4 +1,4 @@
-# pylint: disable=import-error; pyright: reportMissingImports=false
+# pylint: disable=import-error
 from typing import Tuple, Union, Optional
 import os
 import re

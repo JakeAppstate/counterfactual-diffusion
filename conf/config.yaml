@@ -1,5 +1,6 @@
 defaults:
   - dataset: justRAIGS
+  - model: diffusion
   - _self_
   - override hydra/hydra_logging: disabled
   - override hydra/job_logging: disabled
