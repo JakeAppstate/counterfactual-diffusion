@@ -1,11 +1,12 @@
 from hydra.utils import instantiate
 import hydra
 from diffusers import AutoencoderKL
+import torchvision
 # from torch.utils.data import DataLoader
 # from torchvision.utils import save_image
 from omegaconf import DictConfig
 
-from src.model import DiffusionModel
+from src.train import train_model
 
 @hydra.main(config_path="../conf", config_name="config", version_base=None)
 def main(cfg: DictConfig):
@@ -20,6 +21,26 @@ def main(cfg: DictConfig):
     unet = instantiate(cfg.model.unet)
     vae = AutoencoderKL.from_pretrained(cfg.model.vae.hf_id)
     scheduler = instantiate(cfg.model.scheduler)
+    transformations = torchvision.transforms.Compose([
+        instantiate(cfg.dataset.yolo),
+        *instantiate(cfg.dataset.transforms),
+    ])
+    augmentations = torchvision.transforms.Compose(*instantiate(cfg.dataset.augmentations))
+    train_model(
+        vae=vae,
+        class_embedder=class_embedder,
+        unet=unet,
+        scheduler=scheduler,
+        optimizer=instantiate(cfg.training.optimizer,
+                              params=[{"ClassEmbedder": class_embedder.parameters()},
+                                      {"UNet": unet.parameters()}]
+                             ),
+        train_ds=train,
+        val_ds=val,
+        transformations=transformations,
+        augmentations=augmentations,
+        **cfg.training.train_loop
+    )
     # train_dataloader = DataLoader(train, batch_size=2, shuffle=True, collate_fn=train.collate_fn)
     # x, y = next(iter(train_dataloader))
     # print(f"Sample batch x shape: {x.shape}, y shape: {y.shape}")

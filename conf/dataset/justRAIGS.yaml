@@ -2,12 +2,23 @@ data_module:
   _target_: src.data.DataModule
   csv_path: data/labels.csv
   data_path: data/
-  yolo_path: yolo.torchscript
   resize_size: 2000
-  target_size: 512
-  yolo_size: 640
   seed: ${seed}
   is_precomputed: false
+yolo:
+  _target_: src.data.CropROITransform
+  yolo_path: yolo.torchscript
+  yolo_size: 640
+  target_size: 512
+transforms:
+  # Will be applied to all datasets
+  - _target_: torchvision.transforms.v2.Normalize
+    # Scale to [-1, 1]
+    mean: [0.5, 0.5, 0.5]
+    std: [0.5, 0.5, 0.5]
+augmentations:
+  # Will only be applied to training dataset
+  # Occurs after all transforms listed above
 val_ratio: 0.2
 test_ratio: 0.2
 include_real: true

@@ -8,15 +8,19 @@ from tqdm import tqdm
 from src.model import ClassEmbedder
 
 def train_model(vae: AutoencoderKL, class_embedder: ClassEmbedder, unet: UNet2DConditionModel,
-                scheduler: Union[DDPMScheduler, DDIMScheduler], train_ds: DataLoader,
-                val_ds: DataLoader, epochs: int, batch_size: int, mixed_precision: str,
-                optimizer: torch.optim.Optimizer, num_workers: int, p_label_dropout: float):
+                scheduler: Union[DDPMScheduler, DDIMScheduler],
+                optimizer: torch.optim.Optimizer, train_ds: DataLoader,
+                val_ds: DataLoader, transformations: torch.nn.Module,
+                augmentations: torch.nn.Module, epochs: int, batch_size: int, mixed_precision: str,
+                num_workers: int, p_label_dropout: float):
     # Run on GPU if available
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device_str)
     vae.to(device)
     class_embedder.to(device)
     unet.to(device)
+    transformations.to(device)
+    augmentations.to(device)
     vae.requires_grad_(False)
     vae.eval()
     unet.train()
@@ -32,14 +36,18 @@ def train_model(vae: AutoencoderKL, class_embedder: ClassEmbedder, unet: UNet2DC
     else:
         dtype = torch.float32
         scaler = None
-    train = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, collate_fn=train_ds.collate_fn)
+    train = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                       num_workers=num_workers, collate_fn=train_ds.collate_fn,
+                       pin_memory=True)
     val = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=val_ds.collate_fn)
+    # Helper function to unpack dataloader and repack after transformations
     # Training loop
     for epoch in range(epochs):
         print(f"Epoch {epoch + 1}/{epochs}")
         for step, (images, labels) in enumerate(tqdm(train)):
             images = images.to(device, dtype=dtype)
             labels = labels.to(device)
+            images = augmentations(transformations(images))
             # Encode images to latents
             with torch.no_grad():
                 if dtype == torch.bfloat16:

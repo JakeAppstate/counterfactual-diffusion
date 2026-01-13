@@ -1,12 +1,13 @@
 # pylint: disable=import-error
-from typing import Tuple, Union, Optional
+from typing import List, Tuple, Union, Optional
 import os
 import re
 import cv2
 import pandas as pd
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+import torchvision
+from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import v2
 
 class BaseDataset(Dataset):
@@ -192,14 +193,9 @@ class RawDataset(BaseDataset):
         - The class depends on BaseDataset for core dataset behaviors (e.g., folder logic),
           and on torchvision (v2.functional) for conversion, resizing, and cropping ops.
     """
-    def __init__(self, resize_size: Union[int, Tuple[int, int]], yolo_size: Union[int, Tuple[int, int]], target_size: Union[int, Tuple[int, int]], df: pd.DataFrame, data_dir: str, yolo_path: str):
+    def __init__(self, resize_size: Union[int, Tuple[int, int]], df: pd.DataFrame, data_dir: str):
         super().__init__(df, data_dir)
         self.resize_size = resize_size if isinstance(resize_size, tuple) else (resize_size, resize_size)
-        self.target_size = target_size if isinstance(target_size, tuple) else (target_size, target_size)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.yolo = torch.jit.load(yolo_path, map_location=self.device)
-        self.yolo.eval()
-        self.yolo_size = yolo_size if isinstance(yolo_size, tuple) else (yolo_size, yolo_size)
 
     def __getitem__(self, idx):
         """
@@ -214,32 +210,6 @@ class RawDataset(BaseDataset):
         img_path = self.df["path"].iloc[idx]
         img = self._preprocess(img_path)
         label = torch.tensor(self.df["label"].iloc[idx])
-        # TODO may need to change to a dictionary depending on training
-        return img, label
-    
-    def collate_fn(self, batch):
-        """
-        Custom collate function that batches images and labels, moves them to the device,
-        and applies YOLO-based cropping to obtain the region of interest (ROI).
-        Args:
-            batch (Sequence[Tuple[torch.Tensor, torch.Tensor]]):
-                Sequence of (image, label) pairs to collate.
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]:
-                - cropped_images: Tensor of shape (batch_size, C, target_h, target_w)
-                  containing cropped image tensors centered on YOLO-predicted ROIs.
-                - labels: Tensor of shape (batch_size, ...) containing stacked label tensors.
-        Note:
-            Cropping and YOLO inference occur on the device (GPU if available) for efficiency.
-        """
-        # May not work on multiple gpus
-        img, label = super().collate_fn(batch)
-        img = img.to(self.device)
-        label = label.to(self.device)
-        img = self._get_croped_roi(img)
-        img = v2.functional.to_dtype(img, torch.float32, scale=True)
-        img = img * 2 - 1.0 # scale to [-1, 1]
-        # TODO apply any processning that occurs after cropping such as scaling
         return img, label
 
     def _preprocess(self, img_path: str):
@@ -258,62 +228,65 @@ class RawDataset(BaseDataset):
         l = clahe.apply(l)
         new_img = cv2.merge((l, a, b))
         img = cv2.cvtColor(new_img, cv2.COLOR_Lab2RGB)
-        # YOLO
+        # To pytorch float tensor
         img = v2.functional.to_image(img)
+        img = v2.functional.to_dtype(img, torch.float32, scale=True)
         return img
 
-    def _get_croped_roi(self, images: torch.Tensor) -> torch.Tensor:
-        """Crops each image in the batch to the target_size centered on the YOLO-predicted bounding box center.
-        Args:
-            images (torch.Tensor): Batch of images of shape (batch_size, C, H, W).
-        Returns:
-            torch.Tensor: Batch of cropped images of shape (batch_size, C, target_h, target_w).
-        Note:
-            This method assumes the YOLO model outputs bounding box centers at indices 0 (x) and 1 (y),
-            and that the object confidence can be found at index 4 across anchors/classes.
-        """
-        batch = v2.functional.to_dtype(images, torch.float32, scale=True)
-        batch = v2.functional.resize(batch, self.yolo_size)
-        # img = torch.unsqueeze(img, 0) # add a batch of 1 for YOLO
+class PrecomputedDataset(BaseDataset):
+    pass
+
+class CropROITransform(torch.nn.Module):
+    def __init__(self, yolo_path: str, yolo_size: Union[int, Tuple[int, int]], target_size: Union[int, Tuple[int, int]]):
+        super().__init__()
+        self.yolo = torch.jit.load(yolo_path, map_location=self.device)
+        self.yolo.eval()
+        self.yolo_size = yolo_size if isinstance(yolo_size, tuple) else (yolo_size, yolo_size)
+        self.target_size = target_size if isinstance(target_size, tuple) else (target_size, target_size)
+    
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        batch = v2.functional.resize(images, self.yolo_size)
         
         with torch.no_grad():
-            output = self.yolo(batch) # output is in the form of [batch, 4 (x, y, w, h) + # of classes, # of anchors]
+            output = self.yolo(batch)
 
         max_conf_indicies = torch.argmax(output[:, 4, :], dim = 1)
         batch_indices = torch.arange(output.size(0), device = output.device)
         x = output[batch_indices, 0, max_conf_indicies]
         y = output[batch_indices, 1, max_conf_indicies]
 
-        # map cordinates from yolo_size to resize_size
-        x = x * self.resize_size[0] / self.yolo_size[0]
-        y = y * self.resize_size[1] / self.yolo_size[1]
+        # map cordinates from yolo_size to original size
+        x = x * images.size(3) / self.yolo_size[0]
+        y = y * images.size(2) / self.yolo_size[1]
 
         target_w, target_h = self.target_size
+
         # convert center x y to top left
         left = x - 0.5 * target_w
-        left = torch.clamp(left, min=0).int()
+        left = torch.clamp(left, min=0)
         top = y - 0.5 * target_h
-        top = torch.clamp(top, min=0).int()
+        top = torch.clamp(top, min=0)
 
-        # crop each at top left
-        cropped_images = []
-        for i in range(output.size(0)):
-            img = v2.functional.crop(images[i], top[i], left[i], target_w, target_h)
-            cropped_images.append(img)
-        return torch.stack(cropped_images).to(torch.uint8)
-
-class PrecomputedDataset(BaseDataset):
-    pass
+        batch = torchvision.ops.roi_align(images=batch,
+                                          boxes=torch.stack([batch_indices,
+                                                             left, top, left + target_w,
+                                                             top + target_h], dim=1),
+                                          output_size=self.target_size)
+        return batch
     
+    def to(self, *args, **kwargs):
+        super().to(*args, **kwargs)
+        self.yolo.to(*args, **kwargs)
+        return self
 
 class DataModule:
-    def __init__(self, csv_path: str, data_path: str, yolo_path: str, resize_size:  Union[int, Tuple[int, int]] = 2_000, target_size:  Union[int, Tuple[int, int]] = 512, seed: int = 7, yolo_size: Union[int, Tuple[int, int]] = 640, is_precomputed: bool = False, n_sample: Union[int, Tuple[int, int, int, int]] = None):
+    def __init__(self, csv_path: str, data_path: str,
+                 resize_size:  Union[int, Tuple[int, int]] = 2_000,
+                 seed: int = 7, is_precomputed: bool = False,
+                 n_sample: Union[int, Tuple[int, int, int, int]] = None):
         self.csv_path = csv_path
         self.data_path = data_path
-        self.yolo_path = yolo_path
         self.resize_size = resize_size
-        self.target_size = target_size
-        self.yolo_size = yolo_size
         self.seed = seed
         self.is_precomputed = is_precomputed
         self.n_sample = n_sample if isinstance(n_sample, tuple) or n_sample is None else (n_sample,) * 4
@@ -331,11 +304,11 @@ class DataModule:
         if self.is_precomputed:
             raise NotImplementedError("TODO: Implement PrecomputedDataset")
         else:
-            train = RawDataset(self.resize_size, self.yolo_size, self.target_size, train_df, self.data_path, self.yolo_path)
-            val = RawDataset(self.resize_size, self.yolo_size, self.target_size, val_df, self.data_path, self.yolo_path)
-            test = RawDataset(self.resize_size, self.yolo_size, self.target_size, test_df, self.data_path, self.yolo_path)
+            train = RawDataset(self.resize_size, train_df, self.data_path)
+            val = RawDataset(self.resize_size, val_df, self.data_path)
+            test = RawDataset(self.resize_size, test_df, self.data_path)
             if include_real:
-                real = RawDataset(self.resize_size, self.yolo_size, self.target_size, real_df, self.data_path, self.yolo_path)
+                real = RawDataset(self.resize_size, real_df, self.data_path)
             else: real = None
         # pylint: disable=possibly-used-before-assignment
         return train, val, test, real
@@ -371,6 +344,3 @@ class DataModule:
             real = None
 
         return train, val, test, real
-
-    def save_preprocessed_dataset(self):
-        pass
