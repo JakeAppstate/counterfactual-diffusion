@@ -17,3 +17,6 @@ train_loop:
   mixed_precision: "bf16"
   num_workers: 8
   p_label_dropout: 0.3
+  num_inference_steps: 50
+  guidance_scale: 3.0
+  n_generate: 3

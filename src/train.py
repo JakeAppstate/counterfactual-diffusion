@@ -6,13 +6,16 @@ import torch
 from tqdm import tqdm
 
 from src.model import ClassEmbedder
+from src.inference import ImageGenerationPipeline, CounterfactualPipeline
 
 def train_model(vae: AutoencoderKL, class_embedder: ClassEmbedder, unet: UNet2DConditionModel,
                 scheduler: Union[DDPMScheduler, DDIMScheduler],
                 optimizer: torch.optim.Optimizer, train_ds: DataLoader,
                 val_ds: DataLoader, transformations: torch.nn.Module,
                 augmentations: torch.nn.Module, epochs: int, batch_size: int, mixed_precision: str,
-                num_workers: int, p_label_dropout: float):
+                num_workers: int, p_label_dropout: float, num_inference_steps: int,
+                guidance_scale: float, n_generate: int):
+    """Train the diffusion model with the given parameters."""
     # Run on GPU if available
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device_str)
@@ -78,8 +81,38 @@ def train_model(vae: AutoencoderKL, class_embedder: ClassEmbedder, unet: UNet2DC
                 loss.backward()
                 optimizer.step()
         # Validation code
+        val_scheduler = DDIMScheduler.from_config(scheduler.config)
+        if epoch % 5 == 0 or epoch == epochs - 1:
+            # TODO Get val loss
+            generation_pipeline = ImageGenerationPipeline(
+                vae=vae,
+                class_embedder=class_embedder,
+                unet=unet,
+                scheduler=val_scheduler
+            )
+            counterfactual_pipeline = CounterfactualPipeline(
+                vae=vae,
+                class_embedder=class_embedder,
+                unet=unet,
+                scheduler=val_scheduler
+            )
+            # [NRG, RG, Null] x N_PER_CLASS
+            labels = torch.tensor([0, 1, class_embedder.null_class_label] * n_generate, device=device)
+            new_images = generation_pipeline(labels=labels,
+                                             num_inference_steps=num_inference_steps,
+                                             guidance_scale=guidance_scale,
+                                             output_type="numpy").images
+            # TODO: Create Gererated Image Grid
+            # Counterfactuals
+            counterfactual_images = counterfactual_pipeline(labels=labels,
+                                                            num_inference_steps=num_inference_steps,
+                                                            guidance_scale=guidance_scale,
+                                                            output_type="numpy").images
+            # TODO Create Counterfactual Visulization
+            # Maybe use a two column grid: original vs counterfactual
+            # TODO Save model checkpoints
     # Finished training :)
-            
+
 
 
 

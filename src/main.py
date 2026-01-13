@@ -1,3 +1,4 @@
+#pylint: disable=E0401
 from hydra.utils import instantiate
 import hydra
 from diffusers import AutoencoderKL
