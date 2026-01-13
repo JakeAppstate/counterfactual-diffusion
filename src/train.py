@@ -7,6 +7,7 @@ from tqdm import tqdm
 
 from src.model import ClassEmbedder
 from src.inference import ImageGenerationPipeline, CounterfactualPipeline
+from src.utils import create_grid
 
 def train_model(vae: AutoencoderKL, class_embedder: ClassEmbedder, unet: UNet2DConditionModel,
                 scheduler: Union[DDPMScheduler, DDIMScheduler],
@@ -81,9 +82,9 @@ def train_model(vae: AutoencoderKL, class_embedder: ClassEmbedder, unet: UNet2DC
                 loss.backward()
                 optimizer.step()
         # Validation code
-        val_scheduler = DDIMScheduler.from_config(scheduler.config)
         if epoch % 5 == 0 or epoch == epochs - 1:
             # TODO Get val loss
+            val_scheduler = DDIMScheduler.from_config(scheduler.config)
             generation_pipeline = ImageGenerationPipeline(
                 vae=vae,
                 class_embedder=class_embedder,
@@ -102,7 +103,8 @@ def train_model(vae: AutoencoderKL, class_embedder: ClassEmbedder, unet: UNet2DC
                                              num_inference_steps=num_inference_steps,
                                              guidance_scale=guidance_scale,
                                              output_type="numpy").images
-            # TODO: Create Gererated Image Grid
+            fig = create_grid(new_images, col_names=["NRG", "RG", "Null"])
+            fig.savefig(f"epoch_{epoch}_generated.png")
             # Counterfactuals
             counterfactual_images = counterfactual_pipeline(labels=labels,
                                                             num_inference_steps=num_inference_steps,
@@ -110,6 +112,7 @@ def train_model(vae: AutoencoderKL, class_embedder: ClassEmbedder, unet: UNet2DC
                                                             output_type="numpy").images
             # TODO Create Counterfactual Visulization
             # Maybe use a two column grid: original vs counterfactual
+            # TODO Diffusion Classification?
             # TODO Save model checkpoints
     # Finished training :)
 
