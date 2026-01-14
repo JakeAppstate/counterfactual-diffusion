@@ -3,14 +3,14 @@ from hydra.utils import instantiate
 import hydra
 from diffusers import AutoencoderKL
 import torchvision
-# from torch.utils.data import DataLoader
-# from torchvision.utils import save_image
+import wandb
 from omegaconf import DictConfig
 
 from src.train import train_model
 
 @hydra.main(config_path="../conf", config_name="config", version_base=None)
 def main(cfg: DictConfig):
+    wandb.init(project = cfg.project_name, config = cfg)
     data_module = instantiate(cfg.dataset.data_module)
     train, val, test, real = data_module.load_datasets(cfg.dataset.val_ratio, cfg.dataset.test_ratio, cfg.dataset.include_real)
     print("Datasets loaded:")
@@ -19,7 +19,9 @@ def main(cfg: DictConfig):
     print(f"Test set size: {len(test)}")
     print(f"Real set size: {len(real)}")
     class_embedder = instantiate(cfg.model.class_embedder)
+    wandb.watch(class_embedder, log="all", log_freq=100)
     unet = instantiate(cfg.model.unet)
+    wandb.watch(unet, log="all", log_freq=100)
     vae = AutoencoderKL.from_pretrained(cfg.model.vae.hf_id)
     scheduler = instantiate(cfg.model.scheduler)
     transformations = torchvision.transforms.Compose([

@@ -1,124 +1,170 @@
 #pylint: disable=E0401
 from typing import Union
+import os
+import matplotlib.pyplot as plt
 from diffusers import AutoencoderKL, UNet2DConditionModel, DDPMScheduler, DDIMScheduler
+import wandb
 from torch.utils.data import DataLoader
 import torch
 from tqdm import tqdm
 
 from src.model import ClassEmbedder
 from src.inference import ImageGenerationPipeline, CounterfactualPipeline
-from src.utils import create_grid
+from src.utils import create_grid, create_counterfactual_grid
 
-def train_model(vae: AutoencoderKL, class_embedder: ClassEmbedder, unet: UNet2DConditionModel,
-                scheduler: Union[DDPMScheduler, DDIMScheduler],
-                optimizer: torch.optim.Optimizer, train_ds: DataLoader,
-                val_ds: DataLoader, transformations: torch.nn.Module,
-                augmentations: torch.nn.Module, epochs: int, batch_size: int, mixed_precision: str,
-                num_workers: int, p_label_dropout: float, num_inference_steps: int,
-                guidance_scale: float, n_generate: int):
-    """Train the diffusion model with the given parameters."""
-    # Run on GPU if available
-    device_str = "cuda" if torch.cuda.is_available() else "cpu"
-    device = torch.device(device_str)
-    vae.to(device)
-    class_embedder.to(device)
-    unet.to(device)
-    transformations.to(device)
-    augmentations.to(device)
-    vae.requires_grad_(False)
-    vae.eval()
-    unet.train()
-    class_embedder.train()
-    # Determine dtype for mixed precision training
-    if mixed_precision == "bf16" and torch.cuda.is_bf16_supported():
-        dtype = torch.bfloat16
-        scaler = None
-        vae.to(dtype=dtype)
-    elif mixed_precision == "fp16":
-        dtype = torch.float16
-        scaler = torch.amp.GradScaler(device_str)
-    else:
-        dtype = torch.float32
-        scaler = None
-    train = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                       num_workers=num_workers, collate_fn=train_ds.collate_fn,
+class Trainer:
+    def __init__(self, scheduler, optimizer, num_epochs, batch_size, mixed_precision, num_workers,
+                 p_label_dropout, num_inference_steps, guidance_scale, num_generate, save_path):
+        self.scheduler = scheduler
+        self.optimizer = optimizer
+        self.num_epochs = num_epochs
+        self.batch_size = batch_size
+        self.mixed_precision = mixed_precision
+        self.num_workers = num_workers
+        self.p_label_dropout = p_label_dropout
+        self.num_inference_steps = num_inference_steps
+        self.guidance_scale = guidance_scale
+        self.num_generate = num_generate
+        self.save_path = save_path
+        os.makedirs(save_path, exist_ok=True)
+        
+        self.device_str = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = torch.device(self.device_str)
+
+        if mixed_precision == "bf16" and torch.cuda.is_bf16_supported():
+            self.dtype = torch.bfloat16
+            self.scaler = None
+        elif mixed_precision == "fp16":
+            self.dtype = torch.float16
+            self.scaler = torch.amp.GradScaler(self.device_str)
+        else:
+            self.dtype = torch.float32
+            self.scaler = None
+
+    def train(self, vae, class_embeddeder, unet, train_ds, val_ds, transformations, augmentations):
+        # TODO: maybe move transformations and augmentations to init?
+        # TODO may not want to add fields to class outside of init
+        # Get device and move all models on to it
+        self.vae = vae.to(self.device)
+        self.class_embedder = class_embeddeder.to(self.device)
+        self.unet = unet.to(self.device)
+        self.transformations = transformations.to(self.device)
+        self.augmentations = augmentations.to(self.device)
+        # Freeze paramaters of models not being trained
+        self.vae.requires_grad_(False)
+        self.vae.eval()
+        self.unet.train()
+        self.class_embedder.train()
+        self.vae.to(dtype=self.dtype)
+        # train and validation data loaders
+        # TODO: may want to use a different dataloader/sampler such as WeightedSampler
+        train = DataLoader(train_ds, batch_size=self.batch_size, shuffle=True,
+                       num_workers=self.num_workers, collate_fn=train_ds.collate_fn,
                        pin_memory=True)
-    val = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=val_ds.collate_fn)
-    # Helper function to unpack dataloader and repack after transformations
-    # Training loop
-    for epoch in range(epochs):
-        print(f"Epoch {epoch + 1}/{epochs}")
-        for step, (images, labels) in enumerate(tqdm(train)):
-            images = images.to(device, dtype=dtype)
-            labels = labels.to(device)
-            images = augmentations(transformations(images))
-            # Encode images to latents
-            with torch.no_grad():
-                if dtype == torch.bfloat16:
-                    images.to(dtype=torch.bfloat16)
-                latents = vae.encode(images).latent_dist.sample() * vae.config.scaling_factor
-            latents = latents.to(torch.float32)
-            # Get noise for training
-            batch_size = latents.size(0)
-            timesteps = torch.randint(0, scheduler.config.num_train_timesteps, (batch_size,), device=device).long()
-            noise = torch.randn_like(latents)
-            noisy_latents = scheduler.add_noise(latents, noise, timesteps)
-            # Label dropout
-            if p_label_dropout > 0.0:
-                drop_mask = torch.rand(labels.shape, device=device) < p_label_dropout
-                labels = labels.masked_fill(drop_mask, class_embedder.null_class_label)
-            # Forward pass
-            optimizer.zero_grad()
-            with torch.amp.autocast(device_str, dtype = dtype, enabled=(mixed_precision in ["fp16", "bf16"])):
-                class_embeddings = class_embedder(labels)
-                noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states = class_embeddings).sample
-                loss = torch.nn.functional.mse_loss(noise_pred, noise)
-            # Backward pass
-            if mixed_precision == "fp16" and scaler is not None:
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                optimizer.step()
-        # Validation code
-        if epoch % 5 == 0 or epoch == epochs - 1:
-            # TODO Get val loss
-            val_scheduler = DDIMScheduler.from_config(scheduler.config)
-            generation_pipeline = ImageGenerationPipeline(
-                vae=vae,
-                class_embedder=class_embedder,
-                unet=unet,
-                scheduler=val_scheduler
+        val = DataLoader(val_ds, batch_size=self.batch_size, shuffle=False, pin_memory=True,
+                         num_workers=self.num_workers, collate_fn=val_ds.collate_fn)
+        global_step = 0
+        for epoch in range(self.num_epochs):
+            for images, labels in tqdm(train):
+                loss = self._train_step(self, images, labels)
+                wandb.log({
+                    "loss": loss,
+                    "epoch": epoch,
+                    "global_step": global_step
+                })
+                global_step += 1
+            if epoch % 5 == 0 or epoch == self.num_epochs - 1:
+                self._validation_step(val, epoch)
+
+
+    def _train_step(self, images, labels, training=True):
+        images = images.to(self.device, self.dtype)
+        labels = labels.to(self.device)
+        if training:
+            images = self.augmentations(self.transformations(images))
+        else:
+            images = self.transformations(images)
+        with torch.no_grad():
+            latents = self.vae.encode(images).latent_dist.sample * self.vae.config.scaling_factor
+        # TODO Verify correct dtype
+        latents = latents.to(torch.float32)
+        timesteps = torch.randint(0, self.scheduler.config.num_train_timesteps,
+                                  (self.batch_size,), device = self.device)
+        noise = torch.randn_like(latents)
+        noisy_latents = self.scheduler.add_noise(latents, noise, timesteps)
+        if self.p_label_dropout > 0:
+            drop_mask = torch.rand(labels.shape, device = self.device) < self.p_label_dropout
+            labels = labels.masked_fill(drop_mask, self.class_embedder.null_class_label)
+        self.optimizer.zero_grad()
+        with torch.amp.autocast(self.device_str, dtype = self.dtype,
+                                enabled = (self.mixed_precision in ["bf16", "fp16"])):
+            class_embeddings = self.class_embedder(labels)
+            noise_pred = self.unet(noisy_latents, timesteps,
+                                   encoder_hidden_states = class_embeddings).sample
+            loss = torch.nn.functional.mse_loss(noise_pred, noise)
+        if self.scaler is not None:
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            self.optimizer.step()
+        return loss.item()
+
+    def generate_images(self, labels, scheduler, output_type = "numpy"):
+        generation_pipeline = ImageGenerationPipeline(
+                vae=self.vae,
+                class_embedder=self.class_embedder,
+                unet=self.unet,
+                scheduler=scheduler
             )
-            counterfactual_pipeline = CounterfactualPipeline(
-                vae=vae,
-                class_embedder=class_embedder,
-                unet=unet,
-                scheduler=val_scheduler
-            )
-            # [NRG, RG, Null] x N_PER_CLASS
-            labels = torch.tensor([0, 1, class_embedder.null_class_label] * n_generate, device=device)
-            new_images = generation_pipeline(labels=labels,
-                                             num_inference_steps=num_inference_steps,
-                                             guidance_scale=guidance_scale,
-                                             output_type="numpy").images
-            fig = create_grid(new_images, col_names=["NRG", "RG", "Null"])
-            fig.savefig(f"epoch_{epoch}_generated.png")
-            # Counterfactuals
-            counterfactual_images = counterfactual_pipeline(labels=labels,
-                                                            num_inference_steps=num_inference_steps,
-                                                            guidance_scale=guidance_scale,
-                                                            output_type="numpy").images
-            # TODO Create Counterfactual Visulization
-            # Maybe use a two column grid: original vs counterfactual
-            # TODO Diffusion Classification?
-            # TODO Save model checkpoints
-    # Finished training :)
-
-
-
-
-
-
+        new_images = generation_pipeline(
+            labels,
+            num_inference_steps=self.num_inference_steps,
+            guidance_scale=self.guidance_scale,
+            output_type=output_type).images
+        return new_images
     
+    def generate_counterfactual(self, images, labels, scheduler, output_type = "numpy"):
+        counterfactual_pipeline = CounterfactualPipeline(
+                vae=self.vae,
+                class_embedder=self.class_embedder,
+                unet=self.unet,
+                scheduler=scheduler
+            )
+        heatmaps = counterfactual_pipeline(
+            images = images, labels=labels,
+            num_inference_steps=self.num_inference_steps,
+            guidance_scale=self.guidance_scale, output_type=output_type).images
+        return heatmaps
+    
+    def _validation_step(self, val, epoch):
+        val_loss = 0
+        with torch.no_grad():
+            for images, labels in val:
+                val_loss += self._train_step(images, labels, training = False)
+        wandb.log({
+            "val_loss": val_loss,
+            "epoch": epoch
+            })
+        val_scheduler = DDIMScheduler.from_config(self.scheduler.config)
+        new_labels = torch.tensor([0, 1, self.class_embedder.null_class_label] * self.num_generate,
+                                  device=self.device)
+        new_images = self.generate_images(new_labels, val_scheduler)
+        gen_fig = create_grid(new_images, ["NRG, RG, Null"])
+        images, labels = next(iter(val))
+        heatmaps = self.generate_counterfactual(images, labels, val_scheduler)
+        cf_fig = create_counterfactual_grid(images, heatmaps, labels)
+        wandb.log({
+            "Generated Images": wandb.Image(gen_fig),
+            "Counterfactual Images": wandb.Image(cf_fig)}
+            )
+        plt.close("all")
+        self._save_model()
+
+    def _save_model(self):
+        self.unet.save_pretrained(os.path.join(self.save_path, "unet"))
+        torch.save(self.class_embedder.state_dict(),
+                   os.path.join(self.save_path, "class_embedder"))
+
+

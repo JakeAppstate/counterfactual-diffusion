@@ -10,5 +10,6 @@ hydra:
     dir: .
 
 seed: 7
+project_name: "Glaucoma Counterfactual DIffusion"
 
 

@@ -7,7 +7,7 @@ data_module:
   is_precomputed: false
 yolo:
   _target_: src.data.CropROITransform
-  yolo_path: yolo.torchscript
+  yolo_path: models/yolo.torchscript
   yolo_size: 640
   target_size: 512
 transforms:
