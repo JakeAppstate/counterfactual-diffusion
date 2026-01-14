@@ -166,5 +166,3 @@ class Trainer:
         self.unet.save_pretrained(os.path.join(self.save_path, "unet"))
         torch.save(self.class_embedder.state_dict(),
                    os.path.join(self.save_path, "class_embedder"))
-
-
