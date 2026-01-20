@@ -1,17 +1,20 @@
+yolo:
+  _target_: src.data.CropROITransform
+  yolo_path: models/yolo.torchscript
+  yolo_size: 640
+  target_size: 512
 data_module:
   _target_: src.data.DataModule
   csv_path: data/labels.csv
   data_path: data/
   resize_size: 2000
   seed: ${seed}
-  is_precomputed: false
-yolo:
-  _target_: src.data.CropROITransform
-  yolo_path: models/yolo.torchscript
-  yolo_size: 640
-  target_size: 512
+  precompute: true
+  precomputed_filepath: "data/computed_boxes.csv"
+  yolo: ${dataset.yolo}
 transforms:
   # Will be applied to all datasets
+  # - ${dataset.yolo}
   - _target_: torchvision.transforms.v2.Normalize
     # Scale to [-1, 1]
     mean: [0.5, 0.5, 0.5]
@@ -19,6 +22,8 @@ transforms:
 augmentations:
   # Will only be applied to training dataset
   # Occurs after all transforms listed above
+  - _target_: torchvision.transforms.v2.Identity # Placeholder as one augmentation is required
 val_ratio: 0.2
 test_ratio: 0.2
+n_sample: null
 include_real: true

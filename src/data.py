@@ -7,6 +7,7 @@ import pandas as pd
 import numpy as np
 import torch
 import torchvision
+from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import v2
 
@@ -42,6 +43,10 @@ class BaseDataset(Dataset):
 
         df["label"] = (df["Final Label"] != "NRG").astype(dtype = np.int32)
         df = df.drop(columns, axis=1)
+
+        if n is not None:
+            df = df.sample(n)
+
         self.df = df
 
     def __len__(self) -> int:
@@ -53,7 +58,7 @@ class BaseDataset(Dataset):
     def __getitem__(self, idx):
         raise NotImplementedError("This is an abstract method")
 
-    def collate_fn(self, batch):
+    # def collate_fn(self, batch):
         """
         Collate a batch of (image, label) pairs into batched tensors and move them to the instance device.
 
@@ -77,9 +82,9 @@ class BaseDataset(Dataset):
             TypeError: If an item in `batch` is not a tuple of two torch.Tensor objects.
             RuntimeError: If tensors in the batch cannot be stacked due to mismatched shapes or dtypes.
         """
-        img = torch.stack([item[0] for item in batch]).to(self.device)
-        label = torch.stack([item[1] for item in batch]).to(self.device)
-        return img, label
+        # img = torch.stack([item[0] for item in batch]).to(self.device)
+        # label = torch.stack([item[1] for item in batch]).to(self.device)
+        # return img, label
 
     def _get_folder(self, id: str) -> int:
         pattern = r"\d+"
@@ -193,9 +198,9 @@ class RawDataset(BaseDataset):
         - The class depends on BaseDataset for core dataset behaviors (e.g., folder logic),
           and on torchvision (v2.functional) for conversion, resizing, and cropping ops.
     """
-    def __init__(self, resize_size: Union[int, Tuple[int, int]], df: pd.DataFrame, data_dir: str):
-        super().__init__(df, data_dir)
-        self.resize_size = resize_size if isinstance(resize_size, tuple) else (resize_size, resize_size)
+    def __init__(self, resize_size: Tuple[int, int], df: pd.DataFrame, data_dir: str, n = None):
+        super().__init__(df, data_dir, n)
+        self.resize_size = resize_size
 
     def __getitem__(self, idx):
         """
@@ -233,20 +238,17 @@ class RawDataset(BaseDataset):
         img = v2.functional.to_dtype(img, torch.float32, scale=True)
         return img
 
-class PrecomputedDataset(BaseDataset):
-    pass
-
 class CropROITransform(torch.nn.Module):
-    def __init__(self, yolo_path: str, yolo_size: Union[int, Tuple[int, int]], target_size: Union[int, Tuple[int, int]]):
+    def __init__(self, yolo_path: str, yolo_size: Union[int, Tuple[int, int]],
+                 target_size: Union[int, Tuple[int, int]]):
         super().__init__()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.yolo = torch.jit.load(yolo_path, map_location=self.device)
         self.yolo.eval()
         self.yolo_size = yolo_size if isinstance(yolo_size, tuple) else (yolo_size, yolo_size)
         self.target_size = target_size if isinstance(target_size, tuple) else (target_size, target_size)
     
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
-        batch = v2.functional.resize(images, self.yolo_size)
-        
+    def get_bounding_boxes(self, batch):
         with torch.no_grad():
             output = self.yolo(batch)
 
@@ -254,46 +256,77 @@ class CropROITransform(torch.nn.Module):
         batch_indices = torch.arange(output.size(0), device = output.device)
         x = output[batch_indices, 0, max_conf_indicies]
         y = output[batch_indices, 1, max_conf_indicies]
-
+        return x, y
+    
+    def convert_boxes(self, x, y, orig_size):
         # map cordinates from yolo_size to original size
-        x = x * images.size(3) / self.yolo_size[0]
-        y = y * images.size(2) / self.yolo_size[1]
-
+        x = x * orig_size[1] / self.yolo_size[0]
+        y = y * orig_size[0] / self.yolo_size[1]
         target_w, target_h = self.target_size
-
         # convert center x y to top left
         left = x - 0.5 * target_w
         left = torch.clamp(left, min=0)
         top = y - 0.5 * target_h
         top = torch.clamp(top, min=0)
 
-        batch = torchvision.ops.roi_align(images=batch,
-                                          boxes=torch.stack([batch_indices,
+        return top, left
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        batch = v2.functional.resize(images, self.yolo_size)
+
+        x, y = self.get_bounding_boxes(batch)
+        top, left = self.convert_boxes(x, y, images.shape[2:])
+        target_w, target_h = self.target_size
+
+        batch_indicies = torch.arange(batch.size(0), device=batch.device)
+        batch = torchvision.ops.roi_align(input=batch,
+                                          boxes=torch.stack([batch_indicies,
                                                              left, top, left + target_w,
                                                              top + target_h], dim=1),
                                           output_size=self.target_size)
         return batch
-    
+
     def to(self, *args, **kwargs):
         super().to(*args, **kwargs)
         self.yolo.to(*args, **kwargs)
         return self
 
+class PrecomputedDataset(RawDataset):
+    def __init__(self, new_df, **kwargs):
+        # TODO Best to refactor at some point due to code reuse in BaseDataset
+        super().__init__(**kwargs)
+        self.df = pd.merge(self.df, new_df, on="path")
+
+    def __getitem__(self, idx):
+        for c in ["y", "x", "h", "w"]:
+            assert c in self.df.columns, \
+                f"{c} column not in dataframe. Need to call add_box_df method"
+        img, label = super().__getitem__(idx)
+        # top, left, height, width = self.df["y"], self.df["x"], self.df["h"], self.df["w"]
+        img = v2.functional.crop(img, self.df["y"].iloc[idx], self.df["x"].iloc[idx],
+                                 self.df["h"].iloc[idx], self.df["w"].iloc[idx])
+        return img, label
+
 class DataModule:
     def __init__(self, csv_path: str, data_path: str,
                  resize_size:  Union[int, Tuple[int, int]] = 2_000,
-                 seed: int = 7, is_precomputed: bool = False,
+                 seed: int = 7, precompute: bool = False,
+                 precomputed_filepath: Optional[str] = None,
+                 yolo: CropROITransform = None,
                  n_sample: Union[int, Tuple[int, int, int, int]] = None):
         self.csv_path = csv_path
         self.data_path = data_path
-        self.resize_size = resize_size
+        self.resize_size = resize_size if isinstance(resize_size, tuple) else resize_size, resize_size
         self.seed = seed
-        self.is_precomputed = is_precomputed
+        self.precompute = precompute
+        self.precomputed_file = precomputed_filepath
+        self.yolo = yolo
         self.n_sample = n_sample if isinstance(n_sample, tuple) or n_sample is None else (n_sample,) * 4
 
-    def load_datasets(self, val_ratio: float = 0.2, test_ratio: float = 0.2, include_real: bool = True) -> Tuple[BaseDataset, BaseDataset, BaseDataset, Optional[BaseDataset]]:
+    def load_datasets(self, val_ratio: float = 0.2, test_ratio: float = 0.2,include_real: bool = True, n_sample = None) -> Tuple[BaseDataset, BaseDataset, BaseDataset, Optional[BaseDataset]]:
         df = pd.read_csv(self.csv_path, sep=';')
-        train_df, val_df, test_df, real_df = self._split_dataframes(df, val_ratio, test_ratio, include_real)
+        train_df, val_df, test_df, real_df = self._split_dataframes(df, val_ratio,
+                                                                    test_ratio, include_real)
         if self.n_sample is not None:
             n1 , n2 , n3 , n4  = self.n_sample
             train_df = train_df.sample(n=n1, random_state=self.seed)
@@ -301,17 +334,17 @@ class DataModule:
             test_df = test_df.sample(n=n3, random_state=self.seed)
             if include_real:
                 real_df = real_df.sample(n=n4, random_state=self.seed)
-        if self.is_precomputed:
-            raise NotImplementedError("TODO: Implement PrecomputedDataset")
-        else:
-            train = RawDataset(self.resize_size, train_df, self.data_path)
-            val = RawDataset(self.resize_size, val_df, self.data_path)
-            test = RawDataset(self.resize_size, test_df, self.data_path)
-            if include_real:
-                real = RawDataset(self.resize_size, real_df, self.data_path)
-            else: real = None
-        # pylint: disable=possibly-used-before-assignment
-        return train, val, test, real
+        
+        new_df = None
+        if self.precompute:
+            if os.path.exists(self.precomputed_file):
+                new_df = pd.read_csv(self.precomputed_file)
+            else:
+                new_df = self._compute_boxes_df(df)
+                new_df.to_csv(self.precomputed_file, index=False)
+    
+        return self._create_datasets(df, include_real, new_df, resize_size = self.resize_size,
+                                     data_dir = self.data_path, n = n_sample)
 
     def _split_dataframes(self, df: pd.DataFrame, val_ratio: float, test_ratio: float, include_real: bool) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame]]:
         pos_df = df[df['Final Label'] == "RG"]
@@ -344,3 +377,63 @@ class DataModule:
             real = None
 
         return train, val, test, real
+    
+    def _create_datasets(self, df, include_real, new_df = None, **kwargs):
+        ds_class = RawDataset
+        if new_df is not None:
+            ds_class = PrecomputedDataset
+            kwargs["new_df"] = new_df
+        train = ds_class(df = df, **kwargs)
+        val = ds_class(df = df, **kwargs)
+        test = ds_class(df = df, **kwargs)
+        real = None
+        if include_real:
+            real = ds_class(df = df, **kwargs)
+        return train, val, test, real
+
+    def _compute_boxes_df(self, df):
+        # Helper Class
+        # pylint: disable-next=missing-class-docstring
+        class PathDataset(Dataset):
+            def __init__(self, ds):
+                self.ds = ds
+            def __len__(self):
+                return len(self.ds)
+            def __getitem__(self, idx):
+                # path = self.ds.df["path"].iloc[idx]
+                img, _ = self.ds[idx]
+                return idx, img
+
+        assert not os.path.exists(self.precomputed_file), f"{self.precomputed_file} already exists"
+        raw_ds = RawDataset(resize_size=self.yolo.yolo_size, df=df, data_dir=self.data_path)
+        path_ds = PathDataset(raw_ds)
+        loader = DataLoader(path_ds, batch_size = 16, num_workers = 8,
+                            shuffle = False, pin_memory = True,
+                            prefetch_factor = 2)
+        print("Computing bounding boxes for ROI")
+        columns = ["path", "x", "y", "w", "h"]
+        all_paths = raw_ds.df["path"].tolist()
+        path_list = []
+        x_list = []
+        y_list = []
+        with torch.no_grad():
+            for idx, images in tqdm(loader):
+                images = images.to(self.yolo.device)
+                x, y = self.yolo.get_bounding_boxes(images)
+                x, y = self.yolo.convert_boxes(x, y, orig_size = self.resize_size)
+                x, y = x.round().int(), y.round().int()
+                paths = [all_paths[i] for i in idx]
+                # x = x.cpu().tolist()
+                # y = y.cpu().tolist()
+                assert len(paths) == len(x) == len(y)
+                path_list += paths
+                x_list.append(x)
+                y_list.append(y)
+        x_list = torch.cat(x_list).cpu().tolist()
+        y_list = torch.cat(y_list).cpu().tolist()
+        n = len(x_list)
+        w = [self.yolo.target_size[0]] * n
+        h = [self.yolo.target_size[1]] * n
+        rows = list(zip(path_list, x_list, y_list, w, h))
+        new_df = pd.DataFrame(data = rows, columns = columns)
+        return new_df

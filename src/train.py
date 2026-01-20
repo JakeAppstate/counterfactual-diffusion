@@ -13,10 +13,11 @@ from src.inference import ImageGenerationPipeline, CounterfactualPipeline
 from src.utils import create_grid, create_counterfactual_grid
 
 class Trainer:
-    def __init__(self, scheduler, optimizer, num_epochs, batch_size, mixed_precision, num_workers,
-                 p_label_dropout, num_inference_steps, guidance_scale, num_generate, save_path):
+    def __init__(self, scheduler, num_epochs, batch_size, mixed_precision, num_workers,
+                 p_label_dropout, num_inference_steps, guidance_scale, num_generate, save_path,
+                 seed):
         self.scheduler = scheduler
-        self.optimizer = optimizer
+        # self.optimizer = optimizer
         self.num_epochs = num_epochs
         self.batch_size = batch_size
         self.mixed_precision = mixed_precision
@@ -27,6 +28,14 @@ class Trainer:
         self.num_generate = num_generate
         self.save_path = save_path
         os.makedirs(save_path, exist_ok=True)
+        self.seed = seed
+
+        self.vae = None
+        self.class_embedder = None
+        self.unet = None
+        self.optimizer = None
+        self.transformations = None
+        self.augmentations = None
         
         self.device_str = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(self.device_str)
@@ -41,13 +50,15 @@ class Trainer:
             self.dtype = torch.float32
             self.scaler = None
 
-    def train(self, vae, class_embeddeder, unet, train_ds, val_ds, transformations, augmentations):
+    def train(self, vae, class_embedder, unet, train_ds, val_ds, 
+              optimizer, transformations, augmentations):
         # TODO: maybe move transformations and augmentations to init?
         # TODO may not want to add fields to class outside of init
         # Get device and move all models on to it
         self.vae = vae.to(self.device)
-        self.class_embedder = class_embeddeder.to(self.device)
+        self.class_embedder = class_embedder.to(self.device)
         self.unet = unet.to(self.device)
+        self.optimizer = optimizer
         self.transformations = transformations.to(self.device)
         self.augmentations = augmentations.to(self.device)
         # Freeze paramaters of models not being trained
@@ -59,14 +70,13 @@ class Trainer:
         # train and validation data loaders
         # TODO: may want to use a different dataloader/sampler such as WeightedSampler
         train = DataLoader(train_ds, batch_size=self.batch_size, shuffle=True,
-                       num_workers=self.num_workers, collate_fn=train_ds.collate_fn,
-                       pin_memory=True)
-        val = DataLoader(val_ds, batch_size=self.batch_size, shuffle=False, pin_memory=True,
-                         num_workers=self.num_workers, collate_fn=val_ds.collate_fn)
+                       num_workers=self.num_workers, pin_memory=True)
+        val = DataLoader(val_ds, batch_size=self.batch_size, shuffle=False,
+                         pin_memory=True, num_workers=self.num_workers)
         global_step = 0
         for epoch in range(self.num_epochs):
             for images, labels in tqdm(train):
-                loss = self._train_step(self, images, labels)
+                loss = self._train_step(images, labels)
                 wandb.log({
                     "loss": loss,
                     "epoch": epoch,
@@ -76,16 +86,16 @@ class Trainer:
             if epoch % 5 == 0 or epoch == self.num_epochs - 1:
                 self._validation_step(val, epoch)
 
-
     def _train_step(self, images, labels, training=True):
-        images = images.to(self.device, self.dtype)
+        images = images.to(self.device)
         labels = labels.to(self.device)
         if training:
             images = self.augmentations(self.transformations(images))
         else:
             images = self.transformations(images)
+        images = images.to(self.dtype)
         with torch.no_grad():
-            latents = self.vae.encode(images).latent_dist.sample * self.vae.config.scaling_factor
+            latents = self.vae.encode(images).latent_dist.sample() * self.vae.config.scaling_factor
         # TODO Verify correct dtype
         latents = latents.to(torch.float32)
         timesteps = torch.randint(0, self.scheduler.config.num_train_timesteps,
@@ -102,16 +112,17 @@ class Trainer:
             noise_pred = self.unet(noisy_latents, timesteps,
                                    encoder_hidden_states = class_embeddings).sample
             loss = torch.nn.functional.mse_loss(noise_pred, noise)
-        if self.scaler is not None:
+        if training and self.scaler is not None:
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
-        else:
+        elif training:
             loss.backward()
             self.optimizer.step()
         return loss.item()
 
     def generate_images(self, labels, scheduler, output_type = "numpy"):
+        generator = torch.Generator(device=self.device).manual_seed(self.seed)
         generation_pipeline = ImageGenerationPipeline(
                 vae=self.vae,
                 class_embedder=self.class_embedder,
@@ -122,6 +133,7 @@ class Trainer:
             labels,
             num_inference_steps=self.num_inference_steps,
             guidance_scale=self.guidance_scale,
+            generator=generator,
             output_type=output_type).images
         return new_images
     

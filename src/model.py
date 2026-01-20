@@ -3,11 +3,6 @@ from torch import nn
 from torch.utils.data import DataLoader
 from diffusers import UNet2DConditionModel, AutoencoderKL, DDPMScheduler, DDIMScheduler
 
-# TODO
-# Create UNET
-# Create Training Pipeline
-# Create Inference Pipeline
-
 class ClassEmbedder(nn.Module):
     def __init__(self, num_classes: int, emb_dim: int):
         super().__init__()
@@ -20,5 +15,6 @@ class ClassEmbedder(nn.Module):
         )
 
     def forward(self, class_labels):
-        return self.class_emb(self.label_emb(class_labels))
+        x = self.class_emb(self.label_emb(class_labels))
+        return x.unsqueeze(1)
     

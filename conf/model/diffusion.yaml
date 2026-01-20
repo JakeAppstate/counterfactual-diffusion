@@ -1,5 +1,5 @@
 vae:
-  hf_id: "stabilityai/stable-diffusion-2-1"
+  hf_id: "stabilityai/sd-vae-ft-mse"
 unet:
   _target_: diffusers.UNet2DConditionModel
   sample_size: 64
@@ -21,7 +21,7 @@ unet:
     "UpBlock2D",
     "UpBlock2D",
   ]
-class_embedding:
+class_embedder:
   _target_: src.model.ClassEmbedder
   num_classes: 2
-  emb_dim: ${unet.cross_attention_dim}
+  emb_dim: ${model.unet.cross_attention_dim}

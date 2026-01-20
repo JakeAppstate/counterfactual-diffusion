@@ -31,7 +31,7 @@ class ImageGenerationPipeline(DiffusionPipeline):
         )
 
     @torch.no_grad()
-    def __call__(self, labels: torch.Tensor[torch.long], num_inference_steps=50, guidance_scale=3.0, generator=None, output_type="pil"):
+    def __call__(self, labels: torch.Tensor, num_inference_steps=50, guidance_scale=3.0, generator=None, output_type="pil"):
         """Generate images from class labels.
         
         Args:

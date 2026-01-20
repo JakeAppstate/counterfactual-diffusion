@@ -1,23 +1,26 @@
-_target_: src.train.Trainer
-scheduler:
-  _target_: diffusers.DDPMScheduler
-  num_train_timesteps: 1000
-  # from StableDiffusion which what the architecture is based on
-  beta_start: 0.00085
-  beta_end: 0.012
-  beta_schedule: "scaled_linear"
-  clip_sample: false
-  prediction_type: "epsilon"
 optimizer:
   _target_: torch.optim.AdamW
+  _partial_: true
   lr: 1e-4
   weight_decay: 0.01
-epochs: 100
-batch_size: 64
-mixed_precision: "bf16"
-num_workers: 8
-p_label_dropout: 0.3
-num_inference_steps: 50
-guidance_scale: 3.0
-n_generate: 3
-save_path: "models/"
+trainer:
+  _target_: src.train.Trainer
+  scheduler:
+    _target_: diffusers.DDPMScheduler
+    num_train_timesteps: 1000
+    # from StableDiffusion which what the architecture is based on
+    beta_start: 0.00085
+    beta_end: 0.012
+    beta_schedule: "scaled_linear"
+    clip_sample: false
+    prediction_type: "epsilon"
+  num_epochs: 100
+  batch_size: 64
+  mixed_precision: "bf16"
+  num_workers: 2
+  p_label_dropout: 0.3
+  num_inference_steps: 50
+  guidance_scale: 3.0
+  num_generate: 3
+  save_path: "models/"
+  seed: ${seed}
