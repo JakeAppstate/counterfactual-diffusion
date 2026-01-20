@@ -169,7 +169,7 @@ class Trainer:
             new_images = self.generate_images(new_labels, val_scheduler)
             heatmaps = self.generate_counterfactual(images, val_scheduler)
         images_np = images.cpu().permute(0, 2, 3, 1).numpy()
-        gen_fig = create_grid(new_images, ["NRG, RG, Null"])
+        gen_fig = create_grid(new_images, ["NRG", "RG", "Null"])
         cf_fig = create_counterfactual_grid(images_np, heatmaps, labels)
         wandb.log({
             "Generated Images": wandb.Image(gen_fig),
