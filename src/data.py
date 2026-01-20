@@ -213,7 +213,6 @@ class RawDataset(BaseDataset):
                 - label is the corresponding label tensor.
         """
         img_path = self.df["path"].iloc[idx]
-        print(img_path)
         img = self._preprocess(img_path)
         label = torch.tensor(self.df["label"].iloc[idx])
         return img, label
@@ -294,7 +293,6 @@ class CropROITransform(torch.nn.Module):
 
 class PrecomputedDataset(RawDataset):
     def __init__(self, new_df, **kwargs):
-        # TODO Best to refactor at some point due to code reuse in BaseDataset
         super().__init__(**kwargs)
         self.df = pd.merge(self.df, new_df, on="path")
 
@@ -304,8 +302,6 @@ class PrecomputedDataset(RawDataset):
                 f"{c} column not in dataframe. Need to call add_box_df method"
         img, label = super().__getitem__(idx)
         # top, left, height, width = self.df["y"], self.df["x"], self.df["h"], self.df["w"]
-        print(self.df["y"].iloc[idx], self.df["x"].iloc[idx],
-                                 self.df["h"].iloc[idx], self.df["w"].iloc[idx])
         img = v2.functional.crop(img, self.df["y"].iloc[idx], self.df["x"].iloc[idx],
                                  self.df["h"].iloc[idx], self.df["w"].iloc[idx])
         return img, label
@@ -332,6 +328,7 @@ class DataModule:
                                                                     test_ratio, include_real)
         if self.n_sample is not None:
             n1 , n2 , n3 , n4  = self.n_sample
+            
             train_df = train_df.sample(n=n1, random_state=self.seed)
             val_df = val_df.sample(n=n2, random_state=self.seed)
             test_df = test_df.sample(n=n3, random_state=self.seed)

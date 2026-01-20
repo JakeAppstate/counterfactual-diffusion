@@ -2,6 +2,7 @@ vae:
   hf_id: "stabilityai/sd-vae-ft-mse"
 unet:
   _target_: diffusers.UNet2DConditionModel
+  _convert_: partial
   sample_size: 64
   in_channels: 4
   out_channels: 4

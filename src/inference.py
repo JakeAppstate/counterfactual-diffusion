@@ -43,7 +43,9 @@ class ImageGenerationPipeline(DiffusionPipeline):
         """
         assert output_type in ["torch", "pil", "numpy"], "output_type must be 'torch', 'pil', or 'numpy'"
         batch_size = labels.shape[0]
-        device = self.device
+        # self.device should exist but self.device throws an eror
+        # not sure why this is the case
+        device = self.unet.device
         labels = labels.to(device)
 
         # Prepare class embeddings
@@ -56,9 +58,10 @@ class ImageGenerationPipeline(DiffusionPipeline):
 
         # Prepare latent noise
         latents = torch.randn(
-            (batch_size, self.unet.in_channels, self.unet.sample_size, self.unet.sample_size),
+            (batch_size, self.unet.config.in_channels, self.unet.sample_size, self.unet.sample_size),
             generator=generator,
-            device=device
+            device=device,
+            dtype = self.unet.dtype
         )
 
         latents = latents * self.scheduler.init_noise_sigma
@@ -84,8 +87,11 @@ class ImageGenerationPipeline(DiffusionPipeline):
 
         # Decode latents to images
         latents = 1 / self.vae.config.scaling_factor * latents
+        # latents = latents.to(self.vae.dtype) # If using mixed precision
         images = self.vae.decode(latents).sample
+        # images = images.to(torch.float32)
         images = torch.clamp((images + 1) / 2, 0, 1).cpu() # scale to [0, 1]
+        images = images.to(torch.float32)
         # convert to output format
         if output_type == "pil":
             images = self.numpy_to_pil(images.permute(0, 2, 3, 1).numpy())
@@ -123,13 +129,15 @@ class CounterfactualPipeline(DiffusionPipeline):
                 "pil", "numpy", and "torch".
         """
         assert output_type in ["torch", "pil", "numpy"], "output_type must be 'torch', 'pil', or 'numpy'"
-        device = self.device
-        images = images.to(device)
+        device = self.unet.device
+        images = images.to(device, dtype = self.vae.dtype)
+        batch_size = images.size(0)
 
         latents = self.vae.encode(images).latent_dist.sample() * self.vae.config.scaling_factor
+        # latents = latents.to(self.unet.dtype)
         # Backwards Process: x_0 -> x_T
         null_embeddings = self.class_embedder(
-            torch.full((images.size(0),), self.class_embedder.null_class_label,
+            torch.full((batch_size,), self.class_embedder.null_class_label,
                        device=device, dtype=torch.long)
         )
         self.reverse_scheduler.set_timesteps(num_inference_steps, device=device)
@@ -139,13 +147,14 @@ class CounterfactualPipeline(DiffusionPipeline):
             latents = self.reverse_scheduler.step(noise_pred, t, latents).prev_sample
         # Forward Process: x_T -> x_0
         healthy_embeddings = self.class_embedder(
-            torch.full((images.size(0),), 0, device=device, dtype=torch.long)
+            torch.full((batch_size,), 0, device=device, dtype=torch.long)
         )
         if guidance_scale > 1.0:
             healthy_embeddings = torch.cat([null_embeddings, healthy_embeddings])
         self.forward_scheduler.set_timesteps(num_inference_steps, device=device)
         for t in self.forward_scheduler.timesteps:
-            latent_model_input = self.forward_scheduler.scale_model_input(latents, t)
+            latent_model_input = latents if guidance_scale <= 1.0 else torch.cat([latents] * 2)
+            latent_model_input = self.reverse_scheduler.scale_model_input(latent_model_input, t)
             noise_pred = self.unet(latent_model_input, t, healthy_embeddings).sample
             if guidance_scale > 1.0:
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
@@ -153,12 +162,13 @@ class CounterfactualPipeline(DiffusionPipeline):
             latents = self.forward_scheduler.step(noise_pred, t, latents).prev_sample
         # Decode latents to images
         latents = 1 / self.vae.config.scaling_factor * latents
-        new_images = self.vae.decode(latents).sample
+        new_images = self.vae.decode(latents).sample.to(images.dtype)
         new_images = torch.clamp((new_images + 1) / 2, 0, 1).cpu() # scale to [0, 1]
         heat_map = torch.mean(torch.abs(new_images - images.cpu()), dim=1, keepdim=True)
         # convert to output format
+        heat_map = heat_map.to(torch.float32)
         if output_type == "pil":
-            images = self.numpy_to_pil(heat_map.permute(0, 2, 3, 1).numpy())
+            heat_map = self.numpy_to_pil(heat_map.permute(0, 2, 3, 1).numpy())
         elif output_type == "numpy":
-            images = heat_map.permute(0, 2, 3, 1).numpy()
+            heat_map = heat_map.permute(0, 2, 3, 1).numpy()
         return ImagePipelineOutput(images=heat_map)

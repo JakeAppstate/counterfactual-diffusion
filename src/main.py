@@ -10,7 +10,8 @@ from omegaconf import DictConfig,OmegaConf
 @hydra.main(config_path="../conf", config_name="config", version_base=None)
 def main(cfg: DictConfig):
     data_module = instantiate(cfg.dataset.data_module)
-    train, val, test, real = data_module.load_datasets(cfg.dataset.val_ratio, cfg.dataset.test_ratio, cfg.dataset.include_real)
+    train, val, test, real = data_module.load_datasets(cfg.dataset.val_ratio, cfg.dataset.test_ratio,
+                                                       cfg.dataset.include_real, cfg.dataset.n_sample)
     print("Datasets loaded:")
     print(f"Train set size: {len(train)}")
     print(f"Validation set size: {len(val)}")

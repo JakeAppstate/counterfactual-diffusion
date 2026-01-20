@@ -25,5 +25,5 @@ augmentations:
   - _target_: torchvision.transforms.v2.Identity # Placeholder as one augmentation is required
 val_ratio: 0.2
 test_ratio: 0.2
-n_sample: null
+n_sample: 1024 # 6 batches
 include_real: true

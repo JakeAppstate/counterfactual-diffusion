@@ -13,13 +13,14 @@ from src.inference import ImageGenerationPipeline, CounterfactualPipeline
 from src.utils import create_grid, create_counterfactual_grid
 
 class Trainer:
-    def __init__(self, scheduler, num_epochs, batch_size, mixed_precision, num_workers,
-                 p_label_dropout, num_inference_steps, guidance_scale, num_generate, save_path,
-                 seed):
+    def __init__(self, scheduler, num_epochs, batch_size, n_counterfactual, mixed_precision,
+                 num_workers, p_label_dropout, num_inference_steps, guidance_scale, num_generate,
+                 save_path, seed):
         self.scheduler = scheduler
         # self.optimizer = optimizer
         self.num_epochs = num_epochs
         self.batch_size = batch_size
+        self.n_counterfactual = n_counterfactual
         self.mixed_precision = mixed_precision
         self.num_workers = num_workers
         self.p_label_dropout = p_label_dropout
@@ -50,7 +51,7 @@ class Trainer:
             self.dtype = torch.float32
             self.scaler = None
 
-    def train(self, vae, class_embedder, unet, train_ds, val_ds, 
+    def train(self, vae, class_embedder, unet, train_ds, val_ds,
               optimizer, transformations, augmentations):
         # TODO: maybe move transformations and augmentations to init?
         # TODO may not want to add fields to class outside of init
@@ -87,8 +88,8 @@ class Trainer:
                 self._validation_step(val, epoch)
 
     def _train_step(self, images, labels, training=True):
-        images = images.to(self.device)
-        labels = labels.to(self.device)
+        images = images.to(self.device, non_blocking = True)
+        labels = labels.to(self.device, non_blocking = True)
         if training:
             images = self.augmentations(self.transformations(images))
         else:
@@ -97,7 +98,7 @@ class Trainer:
         with torch.no_grad():
             latents = self.vae.encode(images).latent_dist.sample() * self.vae.config.scaling_factor
         # TODO Verify correct dtype
-        latents = latents.to(torch.float32)
+        # latents = latents.to(torch.float32)
         timesteps = torch.randint(0, self.scheduler.config.num_train_timesteps,
                                   (self.batch_size,), device = self.device)
         noise = torch.randn_like(latents)
@@ -137,7 +138,7 @@ class Trainer:
             output_type=output_type).images
         return new_images
     
-    def generate_counterfactual(self, images, labels, scheduler, output_type = "numpy"):
+    def generate_counterfactual(self, images, scheduler, output_type = "numpy"):
         counterfactual_pipeline = CounterfactualPipeline(
                 vae=self.vae,
                 class_embedder=self.class_embedder,
@@ -145,7 +146,7 @@ class Trainer:
                 scheduler=scheduler
             )
         heatmaps = counterfactual_pipeline(
-            images = images, labels=labels,
+            images = images,
             num_inference_steps=self.num_inference_steps,
             guidance_scale=self.guidance_scale, output_type=output_type).images
         return heatmaps
@@ -155,22 +156,26 @@ class Trainer:
         with torch.no_grad():
             for images, labels in val:
                 val_loss += self._train_step(images, labels, training = False)
-        wandb.log({
-            "val_loss": val_loss,
-            "epoch": epoch
-            })
+        wandb.log({"val_loss": val_loss, "epoch": epoch})
+        torch.cuda.empty_cache()
         val_scheduler = DDIMScheduler.from_config(self.scheduler.config)
+        images, labels = next(iter(val))
+        images = images[:self.n_counterfactual]
+        labels = labels[:self.n_counterfactual]
         new_labels = torch.tensor([0, 1, self.class_embedder.null_class_label] * self.num_generate,
                                   device=self.device)
-        new_images = self.generate_images(new_labels, val_scheduler)
+        with torch.amp.autocast(self.device_str, dtype = self.dtype,
+                                enabled = (self.mixed_precision in ["bf16", "fp16"])):
+            new_images = self.generate_images(new_labels, val_scheduler)
+            heatmaps = self.generate_counterfactual(images, val_scheduler)
+        images_np = images.cpu().permute(0, 2, 3, 1).numpy()
         gen_fig = create_grid(new_images, ["NRG, RG, Null"])
-        images, labels = next(iter(val))
-        heatmaps = self.generate_counterfactual(images, labels, val_scheduler)
-        cf_fig = create_counterfactual_grid(images, heatmaps, labels)
+        cf_fig = create_counterfactual_grid(images_np, heatmaps, labels)
         wandb.log({
             "Generated Images": wandb.Image(gen_fig),
-            "Counterfactual Images": wandb.Image(cf_fig)}
-            )
+            "Counterfactual Images": wandb.Image(cf_fig),
+            "epoch": epoch
+            })
         plt.close("all")
         self._save_model()
 
