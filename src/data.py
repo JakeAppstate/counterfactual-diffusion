@@ -213,6 +213,7 @@ class RawDataset(BaseDataset):
                 - label is the corresponding label tensor.
         """
         img_path = self.df["path"].iloc[idx]
+        print(img_path)
         img = self._preprocess(img_path)
         label = torch.tensor(self.df["label"].iloc[idx])
         return img, label
@@ -254,8 +255,8 @@ class CropROITransform(torch.nn.Module):
 
         max_conf_indicies = torch.argmax(output[:, 4, :], dim = 1)
         batch_indices = torch.arange(output.size(0), device = output.device)
-        x = output[batch_indices, 0, max_conf_indicies]
-        y = output[batch_indices, 1, max_conf_indicies]
+        x = output[batch_indices, 1, max_conf_indicies]
+        y = output[batch_indices, 0, max_conf_indicies]
         return x, y
     
     def convert_boxes(self, x, y, orig_size):
@@ -303,6 +304,8 @@ class PrecomputedDataset(RawDataset):
                 f"{c} column not in dataframe. Need to call add_box_df method"
         img, label = super().__getitem__(idx)
         # top, left, height, width = self.df["y"], self.df["x"], self.df["h"], self.df["w"]
+        print(self.df["y"].iloc[idx], self.df["x"].iloc[idx],
+                                 self.df["h"].iloc[idx], self.df["w"].iloc[idx])
         img = v2.functional.crop(img, self.df["y"].iloc[idx], self.df["x"].iloc[idx],
                                  self.df["h"].iloc[idx], self.df["w"].iloc[idx])
         return img, label

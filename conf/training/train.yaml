@@ -17,7 +17,7 @@ trainer:
   num_epochs: 100
   batch_size: 64
   mixed_precision: "bf16"
-  num_workers: 2
+  num_workers: 8
   p_label_dropout: 0.3
   num_inference_steps: 50
   guidance_scale: 3.0
