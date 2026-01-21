@@ -103,7 +103,7 @@ class Trainer:
         # TODO Verify correct dtype
         # latents = latents.to(torch.float32)
         timesteps = torch.randint(0, self.scheduler.config.num_train_timesteps,
-                                  (self.batch_size,), device = self.device)
+                                  (images.size(0),), device = self.device)
         noise = torch.randn_like(latents)
         noisy_latents = self.scheduler.add_noise(latents, noise, timesteps)
         if self.p_label_dropout > 0:
