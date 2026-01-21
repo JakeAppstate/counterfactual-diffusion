@@ -32,9 +32,6 @@ def main(cfg: DictConfig):
     # scheduler = instantiate(cfg.model.scheduler)
     transformations = torchvision.transforms.v2.Compose(instantiate(cfg.dataset.transforms))
     augmentations = torchvision.transforms.v2.Compose(instantiate(cfg.dataset.augmentations))
-    img, _ = train[0]
-    img = img.permute(1, 2, 0).numpy()
-    wandb.log({"Train Dataset Image": wandb.Image(img)})
     trainer = instantiate(cfg.training.trainer)
     trainer.train(vae, class_embedder, unet, train, val,
               optimizer, transformations, augmentations)

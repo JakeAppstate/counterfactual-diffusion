@@ -35,7 +35,7 @@ trainer:
   #   with_stack: true
   num_epochs: 100
   batch_size: 64
-  n_counterfactual: 8
+  n_counterfactual: 4 # N per class not total number generated
   mixed_precision: "bf16"
   num_workers: 8
   p_label_dropout: 0.3

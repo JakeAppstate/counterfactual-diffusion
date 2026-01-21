@@ -57,6 +57,11 @@ class BaseDataset(Dataset):
 
     def __getitem__(self, idx):
         raise NotImplementedError("This is an abstract method")
+    
+    def get_label_indicies(self):
+        pos_idx = self.df[self.df["label"] == 1].index.tolist()
+        neg_idx = self.df[self.df["label"] == 0].index.tolist()
+        return neg_idx, pos_idx
 
     # def collate_fn(self, batch):
         """
@@ -328,7 +333,10 @@ class DataModule:
                                                                     test_ratio, include_real)
         if self.n_sample is not None:
             n1 , n2 , n3 , n4  = self.n_sample
-            
+            n1 = min(n1, len(train_df))
+            n2 = min(n2, len(val_df))
+            n3 = min(n3, len(test_df))
+            n4 = min(n4, len(real_df))
             train_df = train_df.sample(n=n1, random_state=self.seed)
             val_df = val_df.sample(n=n2, random_state=self.seed)
             test_df = test_df.sample(n=n3, random_state=self.seed)
