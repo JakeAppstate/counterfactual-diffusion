@@ -37,7 +37,7 @@ trainer:
   batch_size: 64
   n_counterfactual: 4 # N per class not total number generated
   mixed_precision: "bf16"
-  num_workers: 8
+  num_workers: 4
   p_label_dropout: 0.3
   num_inference_steps: 50
   guidance_scale: 3.0

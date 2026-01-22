@@ -22,9 +22,9 @@ def main(cfg: DictConfig):
     )
     wandb.init(project = cfg.project_name, config = wandb_config)
     class_embedder = instantiate(cfg.model.class_embedder)
-    wandb.watch(class_embedder, log="all", log_freq=100)
+    # wandb.watch(class_embedder, log="all", log_freq=100)
     unet = instantiate(cfg.model.unet)
-    wandb.watch(unet, log="all", log_freq=100)
+    # wandb.watch(unet, log="all", log_freq=100)
     vae = AutoencoderKL.from_pretrained(cfg.model.vae.hf_id)
     optimizer=instantiate(cfg.training.optimizer)(params=[
         {"params": class_embedder.parameters()},

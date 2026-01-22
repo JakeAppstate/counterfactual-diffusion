@@ -351,7 +351,8 @@ class DataModule:
                 new_df = self._compute_boxes_df(df)
                 new_df.to_csv(self.precomputed_file, index=False)
     
-        return self._create_datasets(df, include_real, new_df, resize_size = self.resize_size,
+        return self._create_datasets(train_df, val_df, test_df, real_df, new_df,
+                                     resize_size = self.resize_size,
                                      data_dir = self.data_path, n = n_sample)
 
     def _split_dataframes(self, df: pd.DataFrame, val_ratio: float, test_ratio: float, include_real: bool) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame]]:
@@ -386,17 +387,17 @@ class DataModule:
 
         return train, val, test, real
     
-    def _create_datasets(self, df, include_real, new_df = None, **kwargs):
+    def _create_datasets(self, train_df, val_df, test_df, real_df, new_df = None, **kwargs):
         ds_class = RawDataset
         if new_df is not None:
             ds_class = PrecomputedDataset
             kwargs["new_df"] = new_df
-        train = ds_class(df = df, **kwargs)
-        val = ds_class(df = df, **kwargs)
-        test = ds_class(df = df, **kwargs)
+        train = ds_class(df = train_df, **kwargs)
+        val = ds_class(df = val_df, **kwargs)
+        test = ds_class(df = test_df, **kwargs)
         real = None
-        if include_real:
-            real = ds_class(df = df, **kwargs)
+        if real_df is not None:
+            real = ds_class(df = real_df, **kwargs)
         return train, val, test, real
 
     def _compute_boxes_df(self, df):
