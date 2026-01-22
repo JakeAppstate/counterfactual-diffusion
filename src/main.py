@@ -2,10 +2,13 @@
 from hydra.utils import instantiate
 import hydra
 from diffusers import AutoencoderKL
-import torchvision
+from torchvision.transforms import v2
 import pandas as pd
 import wandb
-from omegaconf import DictConfig,OmegaConf
+from omegaconf import DictConfig, OmegaConf
+
+# List enum values here
+OmegaConf.register_new_resolver("interpolation", lambda name: v2.InterpolationMode[name])
 
 @hydra.main(config_path="../conf", config_name="config", version_base=None)
 def main(cfg: DictConfig):
@@ -30,8 +33,8 @@ def main(cfg: DictConfig):
         {"params": class_embedder.parameters()},
         {"params": unet.parameters()}])
     # scheduler = instantiate(cfg.model.scheduler)
-    transformations = torchvision.transforms.v2.Compose(instantiate(cfg.dataset.transforms))
-    augmentations = torchvision.transforms.v2.Compose(instantiate(cfg.dataset.augmentations))
+    transformations = v2.Compose(instantiate(cfg.dataset.transforms))
+    augmentations = v2.Compose(instantiate(cfg.dataset.augmentations))
     trainer = instantiate(cfg.training.trainer)
     trainer.train(vae, class_embedder, unet, train, val,
               optimizer, transformations, augmentations)

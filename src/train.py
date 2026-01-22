@@ -94,7 +94,8 @@ class Trainer:
         images = images.to(self.device, non_blocking = True)
         labels = labels.to(self.device, non_blocking = True)
         if training:
-            images = self.augmentations(self.transformations(images))
+            # images = self.augmentations(self.transformations(images))
+            images = self.transformations(self.augmentations(images))
         else:
             images = self.transformations(images)
         images = images.to(self.dtype)

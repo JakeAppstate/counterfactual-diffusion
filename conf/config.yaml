@@ -1,5 +1,6 @@
 defaults:
   - dataset: justRAIGS
+  - /dataset/augmentations@_here_: many
   - model: diffusion
   - training: train
   - _self_
