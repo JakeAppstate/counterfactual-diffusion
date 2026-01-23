@@ -1,5 +1,6 @@
-# Used to reduce path lengths
-v2: torchvision.transforms.v2
+defaults:
+  - augmentations: many
+  - _self_
 
 yolo:
   _target_: src.data.CropROITransform
@@ -14,11 +15,15 @@ data_module:
   seed: ${seed}
   precompute: true
   precomputed_filepath: "data/computed_boxes.csv"
-  yolo: ${dataset.yolo}
-transforms:
+  yolo: ${..yolo}
+  n_sample: [128, 128, null, null]
+
+transformations:
+  _target_: ${const.v2}.Compose
+  transforms:
   # Will be applied to all datasets
   # - ${dataset.yolo}
-  - _target_: ${v2}.Normalize
+  - _target_: ${const.v2}.Normalize
     # Scale to [-1, 1]
     mean: [0.5, 0.5, 0.5]
     std: [0.5, 0.5, 0.5]
@@ -26,5 +31,4 @@ transforms:
 oversample: true
 val_ratio: 0.2
 test_ratio: 0.2
-n_sample: null
 include_real: true

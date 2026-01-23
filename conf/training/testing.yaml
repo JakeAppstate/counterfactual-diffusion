@@ -33,11 +33,11 @@ trainer:
   #   record_shapes: true
   #   profile_memory: true
   #   with_stack: true
-  num_epochs: 100
-  batch_size: 64
+  num_epochs: 5
+  batch_size: 16
   n_counterfactual: 4 # N per class not total number generated
   mixed_precision: "bf16"
-  num_workers: 4
+  num_workers: 0
   p_label_dropout: 0.3
   num_inference_steps: 75
   guidance_scale: 3.0

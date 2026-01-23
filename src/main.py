@@ -12,10 +12,11 @@ OmegaConf.register_new_resolver("interpolation", lambda name: v2.InterpolationMo
 
 @hydra.main(config_path="../conf", config_name="config", version_base=None)
 def main(cfg: DictConfig):
-    data_module = instantiate(cfg.dataset.data_module)
-    train, val, test, real = data_module.load_datasets(cfg.dataset.val_ratio, cfg.dataset.test_ratio,
-                                                       cfg.dataset.include_real, cfg.dataset.n_sample)
-    train_sampler = data_module.get_sampler(train, oversample = cfg.dataset.oversample)
+    data_module = instantiate(cfg.data.data_module)
+    datasets = data_module.load_datasets(cfg.data.val_ratio, cfg.data.test_ratio,
+                                         cfg.data.include_real)
+    train, val, test, real = datasets
+    train_sampler = data_module.get_sampler(train, oversample = cfg.data.oversample)
     val_sampler = data_module.get_sampler(val, oversample = False,
                                           replacement = False, use_generator = True)
     print("Datasets loaded:")
@@ -36,8 +37,8 @@ def main(cfg: DictConfig):
         {"params": class_embedder.parameters()},
         {"params": unet.parameters()}])
     # scheduler = instantiate(cfg.model.scheduler)
-    transformations = v2.Compose(instantiate(cfg.dataset.transforms))
-    augmentations = v2.Compose(instantiate(cfg.dataset.augmentations))
+    transformations = instantiate(cfg.data.transformations)
+    augmentations = instantiate(cfg.data.augmentations)
     trainer = instantiate(cfg.training.trainer)
     trainer.train(vae, class_embedder, unet, train, val, optimizer,
                   transformations, augmentations, train_sampler, val_sampler)

@@ -1,0 +1,34 @@
+defaults:
+  - augmentations: many
+  - _self_
+
+yolo:
+  _target_: src.data.CropROITransform
+  yolo_path: models/yolo.torchscript
+  yolo_size: 640
+  target_size: 512
+data_module:
+  _target_: src.data.DataModule
+  csv_path: data/labels.csv
+  data_path: data/
+  resize_size: 2000
+  seed: ${seed}
+  precompute: true
+  precomputed_filepath: "data/computed_boxes.csv"
+  yolo: ${..yolo}
+  n_sample: null
+
+transformations:
+  _target_: ${const.v2}.Compose
+  transforms:
+  # Will be applied to all datasets
+  # - ${dataset.yolo}
+  - _target_: ${const.v2}.Normalize
+    # Scale to [-1, 1]
+    mean: [0.5, 0.5, 0.5]
+    std: [0.5, 0.5, 0.5]
+
+oversample: true
+val_ratio: 0.2
+test_ratio: 0.2
+include_real: true

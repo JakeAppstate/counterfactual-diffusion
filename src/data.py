@@ -25,7 +25,7 @@ class BaseDataset(Dataset):
         __getitem__(idx): Abstract method to retrieve a sample by index.
         collate_fn(batch): Custom collate function to stack images and labels.
     """
-    def __init__(self, df: pd.DataFrame, data_dir: str, n: int = None):
+    def __init__(self, df: pd.DataFrame, data_dir: str):
         """
         Initializes the BaseDataset with a DataFrame and data directory.
 
@@ -43,9 +43,6 @@ class BaseDataset(Dataset):
 
         df["label"] = (df["Final Label"] != "NRG").astype(dtype = np.int32)
         df = df.drop(columns, axis=1)
-
-        if n is not None:
-            df = df.sample(n)
 
         self.df = df
 
@@ -209,8 +206,8 @@ class RawDataset(BaseDataset):
         - The class depends on BaseDataset for core dataset behaviors (e.g., folder logic),
           and on torchvision (v2.functional) for conversion, resizing, and cropping ops.
     """
-    def __init__(self, resize_size: Tuple[int, int], df: pd.DataFrame, data_dir: str, n = None):
-        super().__init__(df, data_dir, n)
+    def __init__(self, resize_size: Tuple[int, int], df: pd.DataFrame, data_dir: str):
+        super().__init__(df, data_dir)
         self.resize_size = resize_size
 
     def __getitem__(self, idx):
@@ -331,18 +328,22 @@ class DataModule:
         self.precompute = precompute
         self.precomputed_file = precomputed_filepath
         self.yolo = yolo
-        self.n_sample = n_sample if isinstance(n_sample, tuple) or n_sample is None else (n_sample,) * 4
+        self.n_sample = (n_sample,) * 4 if isinstance(n_sample, int) else n_sample
+        # self.n_sample = n_sample if isinstance(n_sample, tuple) or n_sample is None else (n_sample,) * 4
 
-    def load_datasets(self, val_ratio: float = 0.2, test_ratio: float = 0.2,include_real: bool = True, n_sample = None) -> Tuple[BaseDataset, BaseDataset, BaseDataset, Optional[BaseDataset]]:
+    def load_datasets(self, val_ratio: float = 0.2, test_ratio: float = 0.2,include_real: bool = True) -> Tuple[BaseDataset, BaseDataset, BaseDataset, Optional[BaseDataset]]:
         df = pd.read_csv(self.csv_path, sep=';')
-        train_df, val_df, test_df, real_df = self._split_dataframes(df, val_ratio,
-                                                                    test_ratio, include_real)
+        dataframes = self._split_dataframes(df, val_ratio, test_ratio, include_real)
+        train_df, val_df, test_df, real_df = dataframes
+        # Get subset of dataset
+        # If sampling here, may be best to modify dfs to be the expected df
+        # output of the BaseDataset.init
         if self.n_sample is not None:
             n1 , n2 , n3 , n4  = self.n_sample
-            n1 = min(n1, len(train_df))
-            n2 = min(n2, len(val_df))
-            n3 = min(n3, len(test_df))
-            n4 = min(n4, len(real_df))
+            n1 = min(n1, len(train_df)) if n1 is not None else len(train_df)
+            n2 = min(n2, len(val_df)) if n2 is not None else len(val_df)
+            n3 = min(n3, len(test_df)) if n3 is not None else len(test_df)
+            n4 = min(n4, len(real_df)) if n4 is not None else len(real_df)
             train_df = train_df.sample(n=n1, random_state=self.seed)
             val_df = val_df.sample(n=n2, random_state=self.seed)
             test_df = test_df.sample(n=n3, random_state=self.seed)
@@ -359,7 +360,7 @@ class DataModule:
     
         return self._create_datasets(train_df, val_df, test_df, real_df, new_df,
                                      resize_size = self.resize_size,
-                                     data_dir = self.data_path, n = n_sample)
+                                     data_dir = self.data_path)
 
     def _split_dataframes(self, df: pd.DataFrame, val_ratio: float, test_ratio: float, include_real: bool) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame]]:
         pos_df = df[df['Final Label'] == "RG"]
@@ -455,10 +456,10 @@ class DataModule:
 
     def get_sampler(self, ds: BaseDataset, oversample: bool,
                     replacement: bool = True, use_generator: bool = False):
-        generator = torch.Generator.manual_seed(self.seed) if use_generator else None
+        generator = torch.Generator().manual_seed(self.seed) if use_generator else None
         if oversample:
             weights = ds.get_sample_weights()
-            return WeightedRandomSampler(weights = weights, num_sample = len(weights),
+            return WeightedRandomSampler(weights = weights, num_samples = len(weights),
                                          replacement = replacement, generator = generator)
         else:
             return RandomSampler(ds, replacement = replacement, generator = generator)

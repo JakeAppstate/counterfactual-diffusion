@@ -77,7 +77,7 @@ class Trainer:
         val = DataLoader(val_ds, batch_size=self.batch_size, shuffle=False,
                          pin_memory=True, num_workers=self.num_workers, sampler=val_sampler)
         global_step = 0
-        for epoch in range(self.num_epochs):
+        for epoch in range(1, self.num_epochs + 1):
             print(f"Starting epoch: {epoch}")
             for images, labels in tqdm(train):
                 loss = self._train_step(images, labels)
@@ -167,30 +167,32 @@ class Trainer:
         # Code shouln't break if this is not the case; images may differ between epochs
         while n_neg < n or n_pos < n:
             batch = next(val_iter)
-            for (img, label) in batch:
+            for img, label in zip(*batch):
                 if label == 1 and n_pos < n:
-                    pos_list += img
+                    pos_list.append(img)
                     n_pos += 1
                 elif label == 0 and n_neg < n:
-                    neg_list += img
+                    neg_list.append(img)
                     n_neg += 1
                 if n_neg >= n and n_pos >= n:
                     break
-        img = torch.cat(neg_list + pos_list)
+        img = torch.stack(neg_list + pos_list)
         labels = torch.cat([torch.zeros((n_neg,)), torch.ones((n_pos,))])
         return img, labels
     
     def _validation_step(self, val, epoch):
         # Calculate val_loss
         val_loss = 0
+        print("Calculating validation loss")
         with torch.no_grad():
-            for images, labels in val:
+            for images, labels in tqdm(val):
                 val_loss += self._train_step(images, labels, training = False)
         wandb.log({"val_loss": val_loss, "epoch": epoch})
         torch.cuda.empty_cache()
-        if epoch % 5 == 0 or epoch == self.num_epochs - 1:
+        if epoch == 1 or epoch % 5 == 0 or epoch == self.num_epochs:
             val_scheduler = DDIMScheduler.from_config(self.scheduler.config)
             # Data for counterfactual. Balanced subset of val
+            print("Getting validation images for counterfactual estimation")
             images, labels = self._get_counterfactual_images(val)
             images = self.transformations(images)
             # New images to be generated
@@ -214,9 +216,14 @@ class Trainer:
                 "epoch": epoch
                 })
             plt.close("all")
+            print("Saving model")
             self._save_model(epoch)
+        print("Finished Validating")
 
     def _save_model(self, epoch):
-        self.unet.save_pretrained(os.path.join(self.save_path, "unet", f"{wandb.run.id}_{epoch:03d}"))
+        save_path = os.path.join(self.save_path, wandb.run.id, f"{epoch:03d}")
+        if not os.path.exists(save_path):
+            os.makedirs(save_path, exist_ok=True)
+        self.unet.save_pretrained(save_path)
         torch.save(self.class_embedder.state_dict(),
-                   os.path.join(self.save_path, "class_embedder", f"{wandb.run.id}_{epoch:03d}.pt"))
+                   os.path.join(save_path, f"class_embedder.pt"))

@@ -1,6 +1,8 @@
+const:
+  v2: torchvision.transforms.v2
+
 defaults:
-  - dataset: justRAIGS
-  - /dataset/augmentations@_here_: many
+  - data: justRAIGS
   - model: diffusion
   - training: train
   - _self_
