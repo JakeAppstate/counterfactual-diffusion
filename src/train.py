@@ -194,8 +194,10 @@ class Trainer:
             images, labels = self._get_counterfactual_images(val)
             images = self.transformations(images)
             # New images to be generated
-            new_labels = torch.tensor([0, 1, self.class_embedder.null_class_label] * self.num_generate,
-                                    device=self.device)
+            new_labels = torch.tensor(
+                [0, 1, self.class_embedder.null_class_label] * self.num_generate,
+                device=self.device
+            )
             with torch.amp.autocast(self.device_str, dtype = self.dtype,
                                     enabled = (self.mixed_precision in ["bf16", "fp16"])):
                 print("Generating new images")
@@ -212,9 +214,9 @@ class Trainer:
                 "epoch": epoch
                 })
             plt.close("all")
-            self._save_model()
+            self._save_model(epoch)
 
-    def _save_model(self):
-        self.unet.save_pretrained(os.path.join(self.save_path, "unet"))
+    def _save_model(self, epoch):
+        self.unet.save_pretrained(os.path.join(self.save_path, "unet", f"{wandb.run.id}_{epoch:03d}"))
         torch.save(self.class_embedder.state_dict(),
-                   os.path.join(self.save_path, "class_embedder"))
+                   os.path.join(self.save_path, "class_embedder", f"{wandb.run.id}_{epoch:03d}.pt"))
