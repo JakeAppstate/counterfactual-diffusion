@@ -52,7 +52,8 @@ class Trainer:
             self.scaler = None
 
     def train(self, vae, class_embedder, unet, train_ds, val_ds,
-              optimizer, transformations, augmentations):
+              optimizer, transformations, augmentations,
+              train_sampler, val_sampler):
         # TODO: maybe move transformations and augmentations to init?
         # TODO may not want to add fields to class outside of init
         # Get device and move all models on to it
@@ -69,12 +70,12 @@ class Trainer:
         self.class_embedder.train()
         self.vae.to(dtype=self.dtype)
         # train and validation data loaders
-        # TODO: may want to use a different dataloader/sampler such as WeightedSampler
-        train = DataLoader(train_ds, batch_size=self.batch_size, shuffle=True,
-                       num_workers=self.num_workers, pin_memory=True)
+        # shuffle is set to false as sampler handles that
+        train = DataLoader(train_ds, batch_size=self.batch_size, shuffle=False,
+                       num_workers=self.num_workers, pin_memory=True, sampler = train_sampler)
         # Moved to val code
-        # val = DataLoader(val_ds, batch_size=self.batch_size, shuffle=False,
-        #                  pin_memory=True, num_workers=self.num_workers)
+        val = DataLoader(val_ds, batch_size=self.batch_size, shuffle=False,
+                         pin_memory=True, num_workers=self.num_workers, sampler=val_sampler)
         global_step = 0
         for epoch in range(self.num_epochs):
             print(f"Starting epoch: {epoch}")
@@ -86,9 +87,10 @@ class Trainer:
                     "global_step": global_step
                 })
                 global_step += 1
-            if epoch % 5 == 0 or epoch == self.num_epochs - 1:
-                print("Running validation code")
-                self._validation_step(val_ds, epoch)
+            self._validation_step(val, epoch)
+            # if epoch % 5 == 0 or epoch == self.num_epochs - 1:
+            #     print("Running validation code")
+            #     self._validation_step(val_ds, epoch)
 
     def _train_step(self, images, labels, training=True):
         images = images.to(self.device, non_blocking = True)
@@ -155,52 +157,62 @@ class Trainer:
             guidance_scale=self.guidance_scale, output_type=output_type).images
         return heatmaps
     
-    def _get_counterfactual_images(self, val_ds):
-        generator = torch.Generator().manual_seed(self.seed)
-        n = self.n_counterfactual 
-        neg_idx, pos_idx = val_ds.get_label_indicies()
-        neg_idx = [neg_idx[i] for i in torch.randint(0, len(neg_idx), size = (n,),
-                                                   generator=generator)]
-        pos_idx = [pos_idx[i] for i in torch.randint(0, len(pos_idx), size = (n,),
-                                                   generator=generator)]
-        neg_images, neg_labels = zip(*[val_ds[i] for i in neg_idx])
-        pos_images, pos_labels = zip(*[val_ds[i] for i in pos_idx])
-        assert (neg_labels == (0,) * n and pos_labels == (1,) * n), \
-            f"{neg_labels} should be all zeros and {pos_labels} should be all ones"
-        return torch.stack(neg_images + pos_images), torch.stack(neg_labels + pos_labels)
+    def _get_counterfactual_images(self, val):
+        n_neg, n_pos = 0, 0
+        n = self.n_counterfactual
+        val_iter = iter(val)
+        neg_list, pos_list = [], []
+        # Assume val dataloader was passed a sampler with a generator
+        # This ensures the order is always the same
+        # Code shouln't break if this is not the case; images may differ between epochs
+        while n_neg < n or n_pos < n:
+            batch = next(val_iter)
+            for (img, label) in batch:
+                if label == 1 and n_pos < n:
+                    pos_list += img
+                    n_pos += 1
+                elif label == 0 and n_neg < n:
+                    neg_list += img
+                    n_neg += 1
+                if n_neg >= n and n_pos >= n:
+                    break
+        img = torch.cat(neg_list + pos_list)
+        labels = torch.cat([torch.zeros((n_neg,)), torch.ones((n_pos,))])
+        return img, labels
     
-    def _validation_step(self, val_ds, epoch):
-        # for loss
-        val = DataLoader(val_ds, batch_size=self.batch_size, shuffle=False,
-                         pin_memory=True, num_workers=self.num_workers)
+    def _validation_step(self, val, epoch):
+        # Calculate val_loss
         val_loss = 0
         with torch.no_grad():
             for images, labels in val:
                 val_loss += self._train_step(images, labels, training = False)
         wandb.log({"val_loss": val_loss, "epoch": epoch})
         torch.cuda.empty_cache()
-        val_scheduler = DDIMScheduler.from_config(self.scheduler.config)
-        # Data for counterfactual. Balanced subset of val
-        images, labels = self._get_counterfactual_images(val_ds)
-        images = self.transformations(images)
-        # New images to be generated
-        new_labels = torch.tensor([0, 1, self.class_embedder.null_class_label] * self.num_generate,
-                                  device=self.device)
-        with torch.amp.autocast(self.device_str, dtype = self.dtype,
-                                enabled = (self.mixed_precision in ["bf16", "fp16"])):
-            new_images = self.generate_images(new_labels, val_scheduler)
-            heatmaps = self.generate_counterfactual(images, val_scheduler)
-        images_np = images.cpu().permute(0, 2, 3, 1).numpy()
-        images_np = (images_np + 1) / 2 # scale to [0,1] for plotting
-        gen_fig = create_grid(new_images, ["NRG", "RG", "Null"])
-        cf_fig = create_counterfactual_grid(images_np, heatmaps, labels)
-        wandb.log({
-            "Generated Images": wandb.Image(gen_fig),
-            "Counterfactual Images": wandb.Image(cf_fig),
-            "epoch": epoch
-            })
-        plt.close("all")
-        self._save_model()
+        if epoch % 5 == 0 or epoch == self.num_epochs - 1:
+            val_scheduler = DDIMScheduler.from_config(self.scheduler.config)
+            # Data for counterfactual. Balanced subset of val
+            images, labels = self._get_counterfactual_images(val)
+            images = self.transformations(images)
+            # New images to be generated
+            new_labels = torch.tensor([0, 1, self.class_embedder.null_class_label] * self.num_generate,
+                                    device=self.device)
+            with torch.amp.autocast(self.device_str, dtype = self.dtype,
+                                    enabled = (self.mixed_precision in ["bf16", "fp16"])):
+                print("Generating new images")
+                new_images = self.generate_images(new_labels, val_scheduler)
+                print("Performing Counterfactual")
+                heatmaps = self.generate_counterfactual(images, val_scheduler)
+            images_np = images.cpu().permute(0, 2, 3, 1).numpy()
+            images_np = (images_np + 1) / 2 # scale to [0,1] for plotting
+            gen_fig = create_grid(new_images, ["NRG", "RG", "Null"])
+            cf_fig = create_counterfactual_grid(images_np, heatmaps, labels)
+            wandb.log({
+                "Generated Images": wandb.Image(gen_fig),
+                "Counterfactual Images": wandb.Image(cf_fig),
+                "epoch": epoch
+                })
+            plt.close("all")
+            self._save_model()
 
     def _save_model(self):
         self.unet.save_pretrained(os.path.join(self.save_path, "unet"))

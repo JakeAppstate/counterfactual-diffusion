@@ -15,6 +15,9 @@ def main(cfg: DictConfig):
     data_module = instantiate(cfg.dataset.data_module)
     train, val, test, real = data_module.load_datasets(cfg.dataset.val_ratio, cfg.dataset.test_ratio,
                                                        cfg.dataset.include_real, cfg.dataset.n_sample)
+    train_sampler = data_module.get_sampler(train, oversample = cfg.dataset.oversample)
+    val_sampler = data_module.get_sampler(val, oversample = False,
+                                          replacement = False, use_generator = True)
     print("Datasets loaded:")
     print(f"Train set size: {len(train)}")
     print(f"Validation set size: {len(val)}")
@@ -36,8 +39,8 @@ def main(cfg: DictConfig):
     transformations = v2.Compose(instantiate(cfg.dataset.transforms))
     augmentations = v2.Compose(instantiate(cfg.dataset.augmentations))
     trainer = instantiate(cfg.training.trainer)
-    trainer.train(vae, class_embedder, unet, train, val,
-              optimizer, transformations, augmentations)
+    trainer.train(vae, class_embedder, unet, train, val, optimizer,
+                  transformations, augmentations, train_sampler, val_sampler)
     # train_dataloader = DataLoader(train, batch_size=2, shuffle=True, collate_fn=train.collate_fn)
     # x, y = next(iter(train_dataloader))
     # print(f"Sample batch x shape: {x.shape}, y shape: {y.shape}")

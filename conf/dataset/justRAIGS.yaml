@@ -22,39 +22,8 @@ transforms:
     # Scale to [-1, 1]
     mean: [0.5, 0.5, 0.5]
     std: [0.5, 0.5, 0.5]
-# augmentations:
-#   # Will only be applied to training dataset
-#   # Occurs before all transforms listed above
-  
-#   # Placeholder as one augmentation is required
-#   # - _target_: torchvision.transforms.v2.Identity
-#   - _target_: ${v2}.RandomHorizontalFlip
-#     p: 0.5
 
-#   - _target_: ${v2}.RandomRotation
-#     degrees: 15
-#     interpolation: ${interpolation:BILINEAR}
-    
-#   - _target_: ${v2}.RandomAffine
-#     degrees: 0
-#     translate: [0.05, 0.05]
-#     scale: [0.95, 1.05]
-#     interpolation:
-#       _target_: hydra.utils.get_object
-#       path: torchvision.transforms.v2.InterpolationMode.BILINEAR
-  
-#   - _target_: ${v2}.RandomResizedCrop
-#     size: ${dataset.yolo.target_size}
-#     scale: [0.9, 1.0]
-#     ratio: [1.0, 1.0]
-#     interpolation: ${interpolation:BILINEAR}
-  
-#   - _target_: ${v2}.ColorJitter
-#     brightness: 0.2
-#     contrast: 0.2
-#     saturation: 0.1
-#     hue: 0
-
+oversample: true
 val_ratio: 0.2
 test_ratio: 0.2
 n_sample: null

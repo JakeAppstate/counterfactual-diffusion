@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import torchvision
 from tqdm import tqdm
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler, RandomSampler
 from torchvision.transforms import v2
 
 class BaseDataset(Dataset):
@@ -58,10 +58,16 @@ class BaseDataset(Dataset):
     def __getitem__(self, idx):
         raise NotImplementedError("This is an abstract method")
     
-    def get_label_indicies(self):
-        pos_idx = self.df[self.df["label"] == 1].index.tolist()
-        neg_idx = self.df[self.df["label"] == 0].index.tolist()
-        return neg_idx, pos_idx
+    # def get_label_indicies(self):
+    #     pos_idx = self.df[self.df["label"] == 1].index.tolist()
+    #     neg_idx = self.df[self.df["label"] == 0].index.tolist()
+    #     return neg_idx, pos_idx
+
+    def get_sample_weights(self):
+        neg_weight = 1 / len(self.df[self.df["label"] == 0])
+        pos_weight = 1 / len(self.df[self.df["label"] == 1])
+        weights = np.where(self.df["label"] == 1, pos_weight, neg_weight)
+        return torch.tensor(weights).double()
 
     # def collate_fn(self, batch):
         """
@@ -446,3 +452,13 @@ class DataModule:
         rows = list(zip(path_list, x_list, y_list, w, h))
         new_df = pd.DataFrame(data = rows, columns = columns)
         return new_df
+
+    def get_sampler(self, ds: BaseDataset, oversample: bool,
+                    replacement: bool = True, use_generator: bool = False):
+        generator = torch.Generator.manual_seed(self.seed) if use_generator else None
+        if oversample:
+            weights = ds.get_sample_weights()
+            return WeightedRandomSampler(weights = weights, num_sample = len(weights),
+                                         replacement = replacement, generator = generator)
+        else:
+            return RandomSampler(ds, replacement = replacement, generator = generator)
