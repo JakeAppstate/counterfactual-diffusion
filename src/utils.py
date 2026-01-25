@@ -38,19 +38,21 @@ def create_grid(images, col_names=List[str]):
     fig.tight_layout()
     return fig
 
-def create_counterfactual_grid(images, heatmaps, labels):
+def create_counterfactual_grid(images, cf_images, heatmaps, labels):
     # TODO May be fun to add another column containing the counterfactual image
-    assert len(images) == len(heatmaps) == len(labels), \
+    assert len(images) == len(cf_images) == len(heatmaps) == len(labels), \
         "images, heatmaps, and labels should have the same length"
     scale = 4
-    fig, axes = plt.subplots(len(images), 2, figsize=(2 * scale, len(images) * scale))
-    for i, (img, hmap) in enumerate(zip(images, heatmaps)):
+    fig, axes = plt.subplots(len(images), 3, figsize=(3 * scale, len(images) * scale))
+    for i, (img, cf, hmap) in enumerate(zip(images, cf_images, heatmaps)):
         label_str = "RG" if labels[i] else "NRG"
         axes[i][0].imshow(img)
         axes[i][0].set_ylabel(label_str, fontsize=scale * 4 )
         _remove_axis(axes[i][0])
-        axes[i][1].imshow(hmap, cmap="plasma")
-        axes[i][1].axis('off')
+        axes[i][1].imshow(cf)
+        axes[i][1].axis("off")
+        axes[i][2].imshow(hmap, cmap="plasma")
+        axes[i][2].axis('off')
         if i == 0:
             axes[i][0].set_title("Original Image", fontsize = scale * 5, pad = 10)
             axes[i][1].set_title("Generated Heatmap", fontsize = scale * 5, pad = 10)

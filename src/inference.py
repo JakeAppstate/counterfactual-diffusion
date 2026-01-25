@@ -3,8 +3,56 @@ import torch
 from diffusers import DiffusionPipeline, ImagePipelineOutput, DDIMScheduler, DDIMInverseScheduler
 
 # TODO Move sampling code to its own function and call that to clean up code
+def _dynamic_normalization(img, p = 0.99):
+    assert img.n_dim == 4
+    # from paper:
+    # th = max(1, percentile(img, p))
+    # img = clip(-th, th)
+    x = torch.abs(img).flatten(2)
+    q = torch.quantile(x, p, dim=-1, keepdim=True)
+    q = torch.max(q, torch.ones_like(q))
+    q = q.unsqueeze(-1).expand(img.shape)
+    return torch.clamp(img, -q, q)
 
-class ImageGenerationPipeline(DiffusionPipeline):
+class _BasePipeline(DiffusionPipeline):
+    def __init__(self, vae, class_embedder, unet, scheduler):
+        super().__init__()
+        self.register_modules(
+            vae=vae,
+            class_embedder=class_embedder,
+            unet=unet,
+            scheduler=scheduler
+        )
+
+    def __call__(self, **kwargs):
+        raise NotImplementedError("This is an abstract base class. Use subclass instead")
+    
+    def _sample(self, latents, labels, n_steps, guidance_scale = 0, use_dn = True):
+        device = self.unet.device
+        class_embeddings = self.class_embedder(labels)
+        if guidance_scale > 1.0:
+            null_labels = torch.fill_like(labels, self.scheduler.null_class_label)
+            null_embeddings = self.class_embedder(null_labels)
+            class_embeddings = torch.cat([null_embeddings, class_embeddings])
+        
+        self.scheduler.set_timesteps(n_steps, device=device)
+        # TODO: add tqdm
+        for t in self.scheduler.timesteps:
+            latent_model_input = latents if guidance_scale <= 1.0 else torch.cat([latents] * 2)
+            latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+            noise_pred = self.unet(latent_model_input, t, class_embeddings).sample
+            if guidance_scale > 1.0:
+                noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+
+            if use_dn:
+                noise_pred = _dynamic_normalization(noise_pred)
+
+            latents = self.scheduler.step(noise_pred, t, latents).prev_sample
+        
+        return latents
+
+class ImageGenerationPipeline(_BasePipeline):
     """A Pipeline for generating images from class label
     
     This pipeline is for generating new images, not for performing the counterfactual.
@@ -14,21 +62,6 @@ class ImageGenerationPipeline(DiffusionPipeline):
         unet (UNet2DConditionModel): U-Net model to denoise the latent representations.
         scheduler (DDPMScheduler or DDIMScheduler): Scheduler to manage the denoising process.
     """
-    def __init__(self, vae, class_embedder, unet, scheduler):
-        """Initialize the ImageGenerationPipeline.
-        
-        Args:
-            vae (AutoencoderKL): Variational Auto-Encoder to encode and decode images to and from latent representations.
-            class_embedder (ClassEmbedder): Model to convert class labels into embeddings.
-            unet (UNet2DConditionModel): U-Net model to denoise the latent representations.
-            scheduler (DDPMScheduler or DDIMScheduler): Scheduler to manage the denoising process."""
-        super().__init__()
-        self.register_modules(
-            vae=vae,
-            class_embedder=class_embedder,
-            unet=unet,
-            scheduler=scheduler
-        )
 
     @torch.no_grad()
     def __call__(self, labels: torch.Tensor, num_inference_steps=50, guidance_scale=3.0, generator=None, output_type="pil"):
@@ -47,50 +80,24 @@ class ImageGenerationPipeline(DiffusionPipeline):
         # not sure why this is the case
         device = self.unet.device
         labels = labels.to(device)
-
-        # Prepare class embeddings
-        class_embeddings = self.class_embedder(labels)
-        if guidance_scale > 1.0:
-            null_labels = torch.full_like(labels, self.class_embedder.null_class_label,
-                                          device=device, dtype=labels.dtype)
-            null_class_embeddings = self.class_embedder(null_labels)
-            class_embeddings = torch.cat([null_class_embeddings, class_embeddings])
-
-        # Prepare latent noise
+        # Starting noises
         latents = torch.randn(
             (batch_size, self.unet.config.in_channels, self.unet.sample_size, self.unet.sample_size),
             generator=generator,
             device=device,
             dtype = self.unet.dtype
         )
-
         latents = latents * self.scheduler.init_noise_sigma
 
-        # Set timesteps
-        self.scheduler.set_timesteps(num_inference_steps, device=device)
-        
-        # Denoising loop
-        for t in self.scheduler.timesteps:
-            latent_model_input = latents if guidance_scale <= 1.0 else torch.cat([latents] * 2)
-            latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-
-            # Predict noise
-            noise_pred = self.unet(latent_model_input, t, class_embeddings).sample
-
-            # Guidance
-            if guidance_scale > 1.0:
-                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-
-            # Implement Dynamic Normalization here if needed
-            latents = self.scheduler.step(noise_pred, t, latents).prev_sample
-
+        # Gernerate latents
+        # TODO may want to change use_dn to false for generating images
+        # Should run test to compare
+        latents = self._sample(latents, labels, num_inference_steps, guidance_scale, use_dn = False)
         # Decode latents to images
         latents = 1 / self.vae.config.scaling_factor * latents
         # latents = latents.to(self.vae.dtype) # If using mixed precision
         images = self.vae.decode(latents).sample
-        # images = images.to(torch.float32)
-        images = torch.clamp((images + 1) / 2, 0, 1).cpu() # scale to [0, 1]
+        # images = torch.clamp((images + 1) / 2, 0, 1).cpu() # scale to [0, 1]
         images = images.to(torch.float32)
         # convert to output format
         if output_type == "pil":
@@ -100,15 +107,12 @@ class ImageGenerationPipeline(DiffusionPipeline):
 
         return ImagePipelineOutput(images=images)
 
-class CounterfactualPipeline(DiffusionPipeline):
+class CounterfactualPipeline(_BasePipeline):
     def __init__(self, vae, class_embedder, unet, scheduler: DDIMScheduler):
-        super().__init__()
-        reverse_scheduler = DDIMInverseScheduler().from_config(scheduler.config)
-        forward_scheduler = scheduler
+        super().__init__(vae, class_embedder, unet, scheduler)
+        reverse_scheduler = DDIMInverseScheduler.from_config(scheduler.config)
+        forward_scheduler = DDIMScheduler.from_config(scheduler.config)
         self.register_modules(
-            vae=vae,
-            class_embedder=class_embedder,
-            unet=unet,
             reverse_scheduler=reverse_scheduler,
             forward_scheduler=forward_scheduler
         )
@@ -136,39 +140,26 @@ class CounterfactualPipeline(DiffusionPipeline):
         latents = self.vae.encode(images).latent_dist.sample() * self.vae.config.scaling_factor
         # latents = latents.to(self.unet.dtype)
         # Backwards Process: x_0 -> x_T
-        null_embeddings = self.class_embedder(
-            torch.full((batch_size,), self.class_embedder.null_class_label,
-                       device=device, dtype=torch.long)
-        )
-        self.reverse_scheduler.set_timesteps(num_inference_steps, device=device)
-        for t in self.reverse_scheduler.timesteps:
-            latent_model_input = self.reverse_scheduler.scale_model_input(latents, t)
-            noise_pred = self.unet(latent_model_input, t, null_embeddings).sample
-            latents = self.reverse_scheduler.step(noise_pred, t, latents).prev_sample
-        # Forward Process: x_T -> x_0
-        healthy_embeddings = self.class_embedder(
-            torch.full((batch_size,), 0, device=device, dtype=torch.long)
-        )
-        if guidance_scale > 1.0:
-            healthy_embeddings = torch.cat([null_embeddings, healthy_embeddings])
-        self.forward_scheduler.set_timesteps(num_inference_steps, device=device)
-        for t in self.forward_scheduler.timesteps:
-            latent_model_input = latents if guidance_scale <= 1.0 else torch.cat([latents] * 2)
-            latent_model_input = self.reverse_scheduler.scale_model_input(latent_model_input, t)
-            noise_pred = self.unet(latent_model_input, t, healthy_embeddings).sample
-            if guidance_scale > 1.0:
-                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-            latents = self.forward_scheduler.step(noise_pred, t, latents).prev_sample
+        null_labels = torch.full((batch_size,), self.class_embedder.null_class_label,
+                                 device = device, dtype = torch.long)
+        healthy_labels = torch.ones((batch_size,), device = device, dtype = torch.long)
+        # Backwards process: encoding img into spacial latent space
+        self.scheduler = self.reverse_scheduler
+        latents = self._sample(latents, null_labels, num_inference_steps)
+        # Forward Process: decoding img back into pixel space
+        self.scheduler = self.forward_scheduler
+        latents = self._sample(latents, healthy_labels, num_inference_steps, guidance_scale)
         # Decode latents to images
         latents = 1 / self.vae.config.scaling_factor * latents
         new_images = self.vae.decode(latents).sample.to(images.dtype)
-        new_images = torch.clamp((new_images + 1) / 2, 0, 1).cpu() # scale to [0, 1]
         heat_map = torch.mean(torch.abs(new_images - images.cpu()), dim=1, keepdim=True)
+        # new_images = torch.clamp((new_images + 1) / 2, 0, 1).cpu() # scale to [0, 1]
         # convert to output format
         heat_map = heat_map.to(torch.float32)
         if output_type == "pil":
+            new_images = self.numpy_to_pil(new_images.permute(0, 2, 3, 1).numpy())
             heat_map = self.numpy_to_pil(heat_map.permute(0, 2, 3, 1).numpy())
         elif output_type == "numpy":
+            new_images = new_images.permute(0, 2, 3, 1).numpy()
             heat_map = heat_map.permute(0, 2, 3, 1).numpy()
-        return ImagePipelineOutput(images=heat_map)
+        return ImagePipelineOutput(images=new_images, heat_map=heat_map)

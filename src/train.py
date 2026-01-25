@@ -1,6 +1,7 @@
 #pylint: disable=E0401
 from typing import Union
 import os
+import numpy as np
 import matplotlib.pyplot as plt
 from diffusers import AutoencoderKL, UNet2DConditionModel, DDPMScheduler, DDIMScheduler
 import wandb
@@ -128,34 +129,50 @@ class Trainer:
             self.optimizer.step()
         return loss.item()
 
-    def generate_images(self, labels, scheduler, output_type = "numpy"):
-        generator = torch.Generator(device=self.device).manual_seed(self.seed)
+    def generate_images(self, scheduler):
         generation_pipeline = ImageGenerationPipeline(
                 vae=self.vae,
                 class_embedder=self.class_embedder,
                 unet=self.unet,
                 scheduler=scheduler
             )
+        classes = [0, 1, self.class_embedder.null_class_label]
+        labels = torch.tensor(
+                classes * self.num_generate,
+                device=self.device
+            )
+        generator = torch.Generator(device=self.device).manual_seed(self.seed)
         new_images = generation_pipeline(
             labels,
             num_inference_steps=self.num_inference_steps,
             guidance_scale=self.guidance_scale,
             generator=generator,
-            output_type=output_type).images
-        return new_images
+            output_type="numpy").images
+        new_images = np.clip((new_images + 1) / 2, 0, 1)
+        label_name_map = ["NRG", "RG", "Null"]
+        fig = create_grid(new_images, [label_name_map[c] for c in classes])
+        return fig
     
-    def generate_counterfactual(self, images, scheduler, output_type = "numpy"):
+    def generate_counterfactual(self, images, labels, scheduler):
         counterfactual_pipeline = CounterfactualPipeline(
                 vae=self.vae,
                 class_embedder=self.class_embedder,
                 unet=self.unet,
                 scheduler=scheduler
             )
-        heatmaps = counterfactual_pipeline(
+        output = counterfactual_pipeline(
             images = images,
             num_inference_steps=self.num_inference_steps,
-            guidance_scale=self.guidance_scale, output_type=output_type).images
-        return heatmaps
+            guidance_scale=self.guidance_scale, output_type="numpy").images
+        def map_for_plotting(np_array):
+            # maps data to [0,1) interval
+            return np.clip((np_array + 1) / 2, 0, 1)
+        cf_images = map_for_plotting(output.new_images)
+        heatmap = map_for_plotting(output.heat_map)
+        images_np = images.permute((0, 2, 3, 1)).cpu().numpy()
+        images_np = map_for_plotting(images_np)
+        fig = create_counterfactual_grid(images_np, cf_images, heatmap, labels)
+        return fig
     
     def _get_counterfactual_images(self, val):
         n_neg, n_pos = 0, 0
@@ -195,21 +212,12 @@ class Trainer:
             print("Getting validation images for counterfactual estimation")
             images, labels = self._get_counterfactual_images(val)
             images = self.transformations(images)
-            # New images to be generated
-            new_labels = torch.tensor(
-                [0, 1, self.class_embedder.null_class_label] * self.num_generate,
-                device=self.device
-            )
             with torch.amp.autocast(self.device_str, dtype = self.dtype,
                                     enabled = (self.mixed_precision in ["bf16", "fp16"])):
                 print("Generating new images")
-                new_images = self.generate_images(new_labels, val_scheduler)
+                gen_fig = self.generate_images(val_scheduler)
                 print("Performing Counterfactual")
-                heatmaps = self.generate_counterfactual(images, val_scheduler)
-            images_np = images.cpu().permute(0, 2, 3, 1).numpy()
-            images_np = (images_np + 1) / 2 # scale to [0,1] for plotting
-            gen_fig = create_grid(new_images, ["NRG", "RG", "Null"])
-            cf_fig = create_counterfactual_grid(images_np, heatmaps, labels)
+                cf_fig = self.generate_counterfactual(images, labels, val_scheduler)
             wandb.log({
                 "Generated Images": wandb.Image(gen_fig),
                 "Counterfactual Images": wandb.Image(cf_fig),
