@@ -55,7 +55,8 @@ def create_counterfactual_grid(images, cf_images, heatmaps, labels):
         axes[i][2].axis('off')
         if i == 0:
             axes[i][0].set_title("Original Image", fontsize = scale * 5, pad = 10)
-            axes[i][1].set_title("Generated Heatmap", fontsize = scale * 5, pad = 10)
+            axes[i][1].set_title("Counterfactual Image", fontsize = scale * 5, pad = 10)
+            axes[i][1].set_title("Heatmap", fontsize = scale * 5, pad = 10)
     fig.tight_layout()
     return fig
 
