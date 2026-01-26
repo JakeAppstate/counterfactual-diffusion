@@ -1,9 +1,9 @@
 #pylint: disable=E0401
-from hydra.utils import instantiate
 import hydra
+from hydra.utils import instantiate
 from diffusers import AutoencoderKL
+import torch
 from torchvision.transforms import v2
-import pandas as pd
 import wandb
 from omegaconf import DictConfig, OmegaConf
 
@@ -12,6 +12,7 @@ OmegaConf.register_new_resolver("interpolation", lambda name: v2.InterpolationMo
 
 @hydra.main(config_path="../conf", config_name="config", version_base=None)
 def main(cfg: DictConfig):
+    torch.manual_seed(cfg.seed)
     data_module = instantiate(cfg.data.data_module)
     datasets = data_module.load_datasets(cfg.data.val_ratio, cfg.data.test_ratio,
                                          cfg.data.include_real)
@@ -42,11 +43,6 @@ def main(cfg: DictConfig):
     trainer = instantiate(cfg.training.trainer)
     trainer.train(vae, class_embedder, unet, train, val, optimizer,
                   transformations, augmentations, train_sampler, val_sampler)
-    # train_dataloader = DataLoader(train, batch_size=2, shuffle=True, collate_fn=train.collate_fn)
-    # x, y = next(iter(train_dataloader))
-    # print(f"Sample batch x shape: {x.shape}, y shape: {y.shape}")
-    # for i in range(x.size(0)):
-    #     save_image(x[i], f"sample_image_{i}_label_{y[i].item()}.png")
 
 if __name__ == "__main__":
     main() # pylint: disable=no-value-for-parameter

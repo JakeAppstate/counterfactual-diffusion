@@ -1,14 +1,19 @@
 #pylint: disable=import-error
+from dataclasses import dataclass
+from typing import Union, List
+import numpy as np
+from PIL.Image import Image
 import torch
 from diffusers import DiffusionPipeline, ImagePipelineOutput, DDIMScheduler, DDIMInverseScheduler
+from diffusers.utils import BaseOutput
 
 # TODO Move sampling code to its own function and call that to clean up code
 def _dynamic_normalization(img, p = 0.99):
-    assert img.n_dim == 4
+    assert img.ndim == 4
     # from paper:
     # th = max(1, percentile(img, p))
     # img = clip(-th, th)
-    x = torch.abs(img).flatten(2)
+    x = torch.abs(img).flatten(2).float()
     q = torch.quantile(x, p, dim=-1, keepdim=True)
     q = torch.max(q, torch.ones_like(q))
     q = q.unsqueeze(-1).expand(img.shape)
@@ -31,7 +36,7 @@ class _BasePipeline(DiffusionPipeline):
         device = self.unet.device
         class_embeddings = self.class_embedder(labels)
         if guidance_scale > 1.0:
-            null_labels = torch.fill_like(labels, self.scheduler.null_class_label)
+            null_labels = torch.full_like(labels, self.class_embedder.null_class_label)
             null_embeddings = self.class_embedder(null_labels)
             class_embeddings = torch.cat([null_embeddings, class_embeddings])
         
@@ -98,7 +103,7 @@ class ImageGenerationPipeline(_BasePipeline):
         # latents = latents.to(self.vae.dtype) # If using mixed precision
         images = self.vae.decode(latents).sample
         # images = torch.clamp((images + 1) / 2, 0, 1).cpu() # scale to [0, 1]
-        images = images.to(torch.float32)
+        images = images.to(torch.float32).cpu()
         # convert to output format
         if output_type == "pil":
             images = self.numpy_to_pil(images.permute(0, 2, 3, 1).numpy())
@@ -106,6 +111,11 @@ class ImageGenerationPipeline(_BasePipeline):
             images = images.permute(0, 2, 3, 1).numpy()
 
         return ImagePipelineOutput(images=images)
+
+@dataclass
+class CounterfactualOutput(BaseOutput):
+    images: Union[List[Image], np.ndarray]
+    heatmaps: Union[List[Image], np.ndarray]
 
 class CounterfactualPipeline(_BasePipeline):
     def __init__(self, vae, class_embedder, unet, scheduler: DDIMScheduler):
@@ -151,7 +161,7 @@ class CounterfactualPipeline(_BasePipeline):
         latents = self._sample(latents, healthy_labels, num_inference_steps, guidance_scale)
         # Decode latents to images
         latents = 1 / self.vae.config.scaling_factor * latents
-        new_images = self.vae.decode(latents).sample.to(images.dtype)
+        new_images = self.vae.decode(latents).sample.to(images.dtype).float().cpu()
         heat_map = torch.mean(torch.abs(new_images - images.cpu()), dim=1, keepdim=True)
         # new_images = torch.clamp((new_images + 1) / 2, 0, 1).cpu() # scale to [0, 1]
         # convert to output format
@@ -162,4 +172,4 @@ class CounterfactualPipeline(_BasePipeline):
         elif output_type == "numpy":
             new_images = new_images.permute(0, 2, 3, 1).numpy()
             heat_map = heat_map.permute(0, 2, 3, 1).numpy()
-        return ImagePipelineOutput(images=new_images, heat_map=heat_map)
+        return CounterfactualOutput(images=new_images, heatmaps=heat_map)

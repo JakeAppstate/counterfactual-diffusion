@@ -163,12 +163,12 @@ class Trainer:
         output = counterfactual_pipeline(
             images = images,
             num_inference_steps=self.num_inference_steps,
-            guidance_scale=self.guidance_scale, output_type="numpy").images
+            guidance_scale=self.guidance_scale, output_type="numpy")
         def map_for_plotting(np_array):
             # maps data to [0,1) interval
             return np.clip((np_array + 1) / 2, 0, 1)
-        cf_images = map_for_plotting(output.new_images)
-        heatmap = map_for_plotting(output.heat_map)
+        cf_images = map_for_plotting(output.images)
+        heatmap = map_for_plotting(output.heatmaps)
         images_np = images.permute((0, 2, 3, 1)).cpu().numpy()
         images_np = map_for_plotting(images_np)
         fig = create_counterfactual_grid(images_np, cf_images, heatmap, labels)
@@ -177,6 +177,8 @@ class Trainer:
     def _get_counterfactual_images(self, val):
         n_neg, n_pos = 0, 0
         n = self.n_counterfactual
+        # Reset the seed so that order is the same between epochs
+        val.sampler.generator.manual_seed(self.seed)
         val_iter = iter(val)
         neg_list, pos_list = [], []
         # Assume val dataloader was passed a sampler with a generator
