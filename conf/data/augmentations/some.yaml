@@ -1,0 +1,31 @@
+_target_: ${const.v2}.Compose
+
+transforms:
+  # Will only be applied to training dataset
+  # Occurs before all transforms listed above
+  - _target_: ${const.v2}.RandomHorizontalFlip
+    p: 0.5
+
+  - _target_: ${const.v2}.RandomRotation
+    degrees: 5
+    interpolation: ${interpolation:BILINEAR}
+    
+  - _target_: ${const.v2}.RandomAffine
+    degrees: 0
+    translate: [0.05, 0.05]
+    scale: [0.95, 1.05]
+    interpolation:
+      _target_: hydra.utils.get_object
+      path: torchvision.transforms.v2.InterpolationMode.BILINEAR
+  
+  - _target_: ${const.v2}.RandomResizedCrop
+    size: ${data.yolo.target_size}
+    scale: [0.9, 1.0]
+    ratio: [1.0, 1.0]
+    interpolation: ${interpolation:BILINEAR}
+  
+  - _target_: ${const.v2}.ColorJitter
+    brightness: 0.1
+    contrast: 0.1
+    saturation: 0.1
+    hue: 0
