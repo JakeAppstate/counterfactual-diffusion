@@ -1,0 +1,13 @@
+_target_: ${const.v2}.Compose
+
+transforms:
+  # Will only be applied to training dataset
+  # Occurs before all transforms listed above
+  - _target_: ${const.v2}.RandomHorizontalFlip
+    p: 0.5
+  
+  - _target_: ${const.v2}.ColorJitter
+    brightness: 0.1
+    contrast: 0.1
+    saturation: 0.1
+    hue: 0
