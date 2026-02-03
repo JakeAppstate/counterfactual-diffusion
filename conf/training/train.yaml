@@ -39,8 +39,9 @@ trainer:
   mixed_precision: "bf16"
   num_workers: 4
   p_label_dropout: 0.3
-  num_inference_steps: 75
-  guidance_scale: 3.0
+  num_inference_steps: ${inference.num_inference_steps}
+  guidance_scale: ${inference.guidance_scale}
+  percent_steps: ${inference.percent_steps}
   num_generate: 3
   save_path: "models/"
   seed: ${seed}

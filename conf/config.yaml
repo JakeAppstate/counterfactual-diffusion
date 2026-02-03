@@ -4,6 +4,7 @@ const:
 defaults:
   - data: justRAIGS
   - model: diffusion
+  - inference: orig
   - training: train
   - _self_
   - override hydra/hydra_logging: disabled
@@ -15,5 +16,7 @@ hydra:
 
 seed: 7
 project_name: "Glaucoma Counterfactual Diffusion"
+# options in ModeEnum
+# mode: ${mode:TRAIN}
 
 
