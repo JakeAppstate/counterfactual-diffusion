@@ -41,7 +41,7 @@ def create_grid(images, col_names: List[str], row_names = None):
     for i in range(n_rows):
         for j in range(n_cols):
             idx = i * n_cols + j
-            axes[idx].imshow(images[i])
+            axes[idx].imshow(images[idx])
             if j == 0 and row_names is not None:
                 axes[idx].set_ylabel(row_names[i], fontsize=scale * 4 )
                 _remove_axis(axes[idx])
@@ -90,10 +90,11 @@ def plot_counterfactual_hyperparams(images, labels, pipeline, hyperparams, defau
         while x <= max_val:
             kwargs[name] = x
             output = pipeline(images, output_type="numpy", **kwargs)
-            cf_images.append(output.heatmaps.copy())
+            cf_images.append(output.heatmaps)
             vals.append(str(x))
             x += inc
-        cf_images = np.concatenate(cf_images, axis=0)
+        _, _, w, h = images.shape
+        cf_images = np.stack(cf_images, axis=1).reshape((-1, w, h, 1)) # heatmaps are grayscale
         cf_images = np.clip((cf_images + 1) / 2, 0, 1)
         fig = create_grid(cf_images, vals, row_names = label_names)
         figs[name] = fig

@@ -33,10 +33,10 @@ class _BasePipeline(DiffusionPipeline):
     def __call__(self, **kwargs):
         raise NotImplementedError("This is an abstract base class. Use subclass instead")
     
-    def _sample(self, latents, labels, n_steps, guidance_scale = 0, p_steps = 1.0, use_dn = True):
-        print(guidance_scale)
+    def _sample(self, latents, labels, n_steps, guidance_scale = 0, use_dn = True,
+                start_idx = 0, stop_idx = -1):
         device = self.unet.device
-        stop_idx = int(n_steps * p_steps)
+        stop_idx = n_steps if stop_idx == -1 else stop_idx
         class_embeddings = self.class_embedder(labels)
         if guidance_scale > 1.0:
             null_labels = torch.full_like(labels, self.class_embedder.null_class_label)
@@ -46,7 +46,7 @@ class _BasePipeline(DiffusionPipeline):
         self.scheduler.set_timesteps(n_steps, device=device)
         # TODO: add tqdm
         with torch.no_grad():
-            for t in tqdm(self.scheduler.timesteps[:stop_idx]):
+            for t in tqdm(self.scheduler.timesteps[start_idx:stop_idx]):
                 latent_model_input = latents if guidance_scale <= 1.0 else torch.cat([latents] * 2)
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
                 noise_pred = self.unet(latent_model_input, t, class_embeddings).sample
@@ -153,6 +153,8 @@ class CounterfactualPipeline(_BasePipeline):
         images = images.to(device, dtype = self.vae.dtype)
         batch_size = images.size(0)
 
+        idx = int(np.ceil(percent_steps * num_inference_steps))
+
         latents = self.vae.encode(images).latent_dist.sample() * self.vae.config.scaling_factor
         # latents = latents.to(self.unet.dtype)
         # Backwards Process: x_0 -> x_T
@@ -162,11 +164,11 @@ class CounterfactualPipeline(_BasePipeline):
         # Backwards process: encoding img into spacial latent space
         print("Perfoming the Backwards Process...")
         self.scheduler = self.reverse_scheduler
-        latents = self._sample(latents, null_labels, num_inference_steps, p_steps = percent_steps, use_dn=use_dn)
+        latents = self._sample(latents, null_labels, num_inference_steps, use_dn=use_dn, stop_idx=idx)
         print("Performing the Forwards Process...")
         # Forward Process: decoding img back into pixel space
         self.scheduler = self.forward_scheduler
-        latents = self._sample(latents, healthy_labels, num_inference_steps, guidance_scale, p_steps = percent_steps, use_dn=use_dn)
+        latents = self._sample(latents, healthy_labels, num_inference_steps, guidance_scale, use_dn=use_dn, start_idx=-idx)
         # Decode latents to images
         latents = 1 / self.vae.config.scaling_factor * latents
         new_images = self.vae.decode(latents).sample.to(images.dtype).float().cpu()
@@ -175,6 +177,8 @@ class CounterfactualPipeline(_BasePipeline):
         # convert to output format
         heat_map = heat_map.to(torch.float32)
         if output_type == "pil":
+            new_images = torch.clamp((new_images + 1) / 2, 0, 1)
+            heat_map = torch.clamp((heat_map + 1) / 2, 0, 1)
             new_images = self.numpy_to_pil(new_images.permute(0, 2, 3, 1).numpy())
             heat_map = self.numpy_to_pil(heat_map.permute(0, 2, 3, 1).numpy())
         elif output_type == "numpy":
