@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import wandb
 
-from inference import CounterfactualPipeline
+from src.inference import CounterfactualPipeline
 
 def _remove_axis(ax):
     # remove axis lines
@@ -94,6 +94,7 @@ def plot_counterfactual_hyperparams(images, labels, pipeline, hyperparams, defau
             vals.append(str(x))
             x += inc
         _, _, w, h = images.shape
+        # use stack and reshape to zipper merge the ndarrays
         cf_images = np.stack(cf_images, axis=1).reshape((-1, w, h, 1)) # heatmaps are grayscale
         cf_images = np.clip((cf_images + 1) / 2, 0, 1)
         fig = create_grid(cf_images, vals, row_names = label_names)

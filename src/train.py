@@ -15,8 +15,8 @@ from src.utils import create_grid, create_counterfactual_grid
 
 class Trainer:
     def __init__(self, scheduler, num_epochs, batch_size, n_counterfactual, mixed_precision,
-                 num_workers, p_label_dropout, num_inference_steps, guidance_scale, num_generate,
-                 save_path, seed):
+                 num_workers, p_label_dropout, num_inference_steps, guidance_scale,
+                 percent_steps, use_dn, num_generate, save_path, seed):
         self.scheduler = scheduler
         # self.optimizer = optimizer
         self.num_epochs = num_epochs
@@ -27,6 +27,8 @@ class Trainer:
         self.p_label_dropout = p_label_dropout
         self.num_inference_steps = num_inference_steps
         self.guidance_scale = guidance_scale
+        self.percent_steps = percent_steps
+        self.use_dn = use_dn
         self.num_generate = num_generate
         self.save_path = save_path
         os.makedirs(save_path, exist_ok=True)
@@ -162,8 +164,11 @@ class Trainer:
             )
         output = counterfactual_pipeline(
             images = images,
-            num_inference_steps=self.num_inference_steps,
-            guidance_scale=self.guidance_scale, output_type="numpy")
+            num_inference_steps = self.num_inference_steps,
+            guidance_scale = self.guidance_scale, 
+            percent_steps = self.percent_steps,
+            use_dn = self.use_dn,
+            output_type="numpy")
         def map_for_plotting(np_array):
             # maps data to [0,1) interval
             return np.clip((np_array + 1) / 2, 0, 1)
