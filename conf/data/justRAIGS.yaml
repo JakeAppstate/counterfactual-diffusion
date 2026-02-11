@@ -1,5 +1,5 @@
 defaults:
-  - augmentations: some
+  - augmentations: little
   - _self_
 
 yolo:
