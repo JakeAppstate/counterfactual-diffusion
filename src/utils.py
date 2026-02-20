@@ -1,10 +1,9 @@
 # pylint: disable=import-error
-from typing import List
+from typing import Iterator, List, Tuple, Union
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 import wandb
-
-from src.inference import CounterfactualPipeline
 
 def _remove_axis(ax):
     # remove axis lines
@@ -25,10 +24,10 @@ def _remove_axis(ax):
     )
 
 # TODO add optional row labels
-def create_grid(images, col_names: List[str], row_names = None):
+def create_grid(images, col_names: List[str] = None, row_names: List[str] = None):
     """Create a grid of images for visualization."""
     n_images = len(images)
-    n_cols = len(col_names)
+    n_cols = len(col_names) if col_names is not None else np.sqrt(n_images).astype(int)
     if row_names is not None:
         n_rows = len(row_names)
         assert (n_rows - 1) * n_cols < n_images <= n_rows * n_cols, \
@@ -41,13 +40,14 @@ def create_grid(images, col_names: List[str], row_names = None):
     for i in range(n_rows):
         for j in range(n_cols):
             idx = i * n_cols + j
-            axes[idx].imshow(images[idx])
+            if idx < n_images:
+                axes[idx].imshow(images[idx])
             if j == 0 and row_names is not None:
                 axes[idx].set_ylabel(row_names[i], fontsize=scale * 4 )
                 _remove_axis(axes[idx])
             else:
                 axes[idx].axis('off')
-            if idx < n_cols:
+            if idx < n_cols and col_names is not None:
                 axes[idx].set_title(col_names[j], fontsize = scale * 5, pad = 10)
     fig.tight_layout()
     return fig
@@ -101,7 +101,47 @@ def plot_counterfactual_hyperparams(images, labels, pipeline, hyperparams, defau
         figs[name] = fig
     return figs
 
+# TODO add option for passing model.parameters() instead of param groups
+def get_optimizer(classname, **kwargs):
+    param_groups = kwargs.pop("param_groups", None)
+    def build(params: Union[List[Tuple[str, Iterator]], Iterator]):
+        # model.parameters() is passed
+        if isinstance(params, Iterator):
+            # only include trainiable weights
+            params = (p for p in params if p.requires_grad)
+            return classname(params = params, **kwargs)
+        # List of (name, param) pairs are passed
+        if param_groups is None:
+            # Parameter groups are not defined. Use defaults for all parameters
+            # Convert list of (name, param) pairs to iter of params
+            params = (p for _, param in params for p in param if p.requires_grad)
+            return classname(params = params, **kwargs)
+        # Parameter groups exist in config and are passed
+        for name, param in params:
+            if name not in param_groups:
+                raise ValueError(f"Missing parameter group {name} in config")
+            param = (p for p in param if p.requires_grad)
+            param_groups[name].params = param
+        return classname(params = param_groups, **kwargs)
+    return build
 
+def temp_load_class_embedder(model, path):
+    state_dict = torch.load(path, weights_only=True)
+    model.load_state_dict(state_dict)
+    return model
+
+def metric_wrapper(y_true: np.array, y_score: np.array, metric_fun,
+                   threshold: float = None, switch_args: bool = False,
+                   is_wandb: bool = False, **kwargs):
+    if threshold is not None:
+        y_score = (y_score >= threshold).astype(int)
+    if is_wandb:
+        y_score = np.stack([1 - y_score, y_score], axis=1)
+    if switch_args:
+        orig_fun = metric_fun
+        #pylint: disable-next:unneccesary-lambda-assignment
+        metric_fun = lambda x, y: orig_fun(y, x)
+    return metric_fun(y_true, y_score, **kwargs)
 
 def trace_handler(p, output_dir, file_prefix):
     filename = f"{file_prefix}_step_{p.step_num}.json.gz"

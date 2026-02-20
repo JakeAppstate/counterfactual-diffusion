@@ -12,87 +12,21 @@ from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler, RandomS
 from torchvision.transforms import v2
 
 class BaseDataset(Dataset):
-    """
-    BaseDataset is an abstract class that serves as a foundation for
-    specific dataset implementations. It handles common functionalities such as
-    loading data from a DataFrame, filtering valid image paths, and preparing labels.
-    Subclasses must implement the __getitem__ method to define how individual
-    data samples are retrieved.
-    Attributes:
-        df (pd.DataFrame): DataFrame containing image paths and labels.
-    Methods:
-        __len__(): Returns the number of samples in the dataset.
-        __getitem__(idx): Abstract method to retrieve a sample by index.
-        collate_fn(batch): Custom collate function to stack images and labels.
-    """
-    def __init__(self, df: pd.DataFrame, data_dir: str):
-        """
-        Initializes the BaseDataset with a DataFrame and data directory.
+    def __init__(self, df, data_path, resize_size):
+        self.data_path = data_path
+        self.resize_size = resize_size
+        self.df = self._get_df(df)
 
-        Args:
-            df (pd.DataFrame): DataFrame containing image paths and labels.
-            data_dir (str): Directory where the images are stored.
-            n (int): Number of total items to include in the dataset.
-                Defaults to None which includes the entire dataset.
-        """
+    def _get_df(self, df):
         columns = ["Eye ID", "Final Label"]
         df = df[columns].copy() # drop all unspecified columns
         df["path"] = df["Eye ID"] \
-            .map(lambda id: os.path.join(data_dir, str(self._get_folder(id)), f"{id}.JPG"))
+            .map(lambda id: os.path.join(self.data_path, str(self._get_folder(id)), f"{id}.JPG"))
         df = df[df["path"].map(os.path.exists)] # filter if image exists
 
         df["label"] = (df["Final Label"] != "NRG").astype(dtype = np.int32)
         df = df.drop(columns, axis=1)
-
-        self.df = df
-
-    def __len__(self) -> int:
-        """
-        Returns the number of samples in the dataset.
-        """
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        raise NotImplementedError("This is an abstract method")
-    
-    # def get_label_indicies(self):
-    #     pos_idx = self.df[self.df["label"] == 1].index.tolist()
-    #     neg_idx = self.df[self.df["label"] == 0].index.tolist()
-    #     return neg_idx, pos_idx
-
-    def get_sample_weights(self):
-        neg_weight = 1 / len(self.df[self.df["label"] == 0])
-        pos_weight = 1 / len(self.df[self.df["label"] == 1])
-        weights = np.where(self.df["label"] == 1, pos_weight, neg_weight)
-        return torch.tensor(weights).double()
-
-    # def collate_fn(self, batch):
-        """
-        Collate a batch of (image, label) pairs into batched tensors and move them to the instance device.
-
-        This method expects `batch` to be an iterable of two-element tuples (image_tensor, label_tensor).
-        Each image tensor and each label tensor must have the same shape and dtype across the batch so that
-        they can be stacked into a single tensor along a new batch dimension.
-
-        Args:
-            batch (Sequence[Tuple[torch.Tensor, torch.Tensor]]): Sequence of (image, label) pairs to collate.
-                - image tensors should have shape (C, H, W) or similar, consistent across items.
-                - label tensors should have a shape compatible for stacking (e.g., scalar, 1-D, or matching dims).
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: A tuple (images, labels) where:
-                - images is a tensor of shape (batch_size, C, H, W, ...) containing stacked image tensors,
-                  moved to `self.device`.
-                - labels is a tensor of shape (batch_size, ...) containing stacked label tensors,
-                  moved to `self.device`.
-
-        Raises:
-            TypeError: If an item in `batch` is not a tuple of two torch.Tensor objects.
-            RuntimeError: If tensors in the batch cannot be stacked due to mismatched shapes or dtypes.
-        """
-        # img = torch.stack([item[0] for item in batch]).to(self.device)
-        # label = torch.stack([item[1] for item in batch]).to(self.device)
-        # return img, label
+        return df
 
     def _get_folder(self, id: str) -> int:
         pattern = r"\d+"
@@ -109,122 +43,17 @@ class BaseDataset(Dataset):
             return 4
         else:
             return 5
-
-class RawDataset(BaseDataset):
-    """ Dataset that computes all preprocessing steps on the fly.
-
-    RawDataset provides dataset handling for images that are preprocessed with CLAHE contrast
-    enhancement and cropped to a region-of-interest (ROI) determined by a pretrained YOLO
-    model. It is intended to be used with a DataLoader that calls the custom collate_fn to
-    perform YOLO-based cropping on a GPU, while file-level reading and CPU-based preprocessing
-    (however minimal) happen per sample.
-    Args:
-        resize_size (int | Tuple[int, int]):
-            Size to which each image is first resized after loading. If an int is provided,
-            it is treated as a square (resize_size, resize_size).
-        target_size (int | Tuple[int, int]):
-            Final crop size (width, height) in pixels that will be extracted around the
-            YOLO-predicted center. If an int is provided, it is treated as a square.
-        df (pandas.DataFrame):
-            DataFrame describing the dataset. Must contain at least the columns:
-                - "path": filesystem path to the image file.
-                - "label": the target label for the image (any type used by training code).
-        data_dir (str):
-            Root directory for dataset files (delegated to BaseDataset for any folder logic).
-        yolo_path (str):
-            Filesystem path to a serialized YOLO model compatible with torch.jit.load. The
-            model is loaded onto the selected device (CUDA if available, otherwise CPU).
-        yolo_size (Tuple[int, int] | int, optional):
-            Size (width, height) used as input to the YOLO model. If an int is provided,
-            it is treated as (yolo_size, yolo_size). Defaults to 640.
-    Attributes:
-        resize_size (Tuple[int, int]):
-            Normalized tuple form of the provided resize_size.
-        target_size (Tuple[int, int]):
-            Normalized tuple form of the provided target_size.
-        device (torch.device):
-            Device used for model inference and cropping (CUDA if available, else CPU).
-        yolo (torch.jit.ScriptModule):
-            ScriptModule loaded from yolo_path and set to eval() for inference.
-        yolo_size (Tuple[int, int]):
-            Normalized tuple form of the provided yolo_size.
-        df (pandas.DataFrame):
-            Reference to the provided DataFrame (inherited/initialized via BaseDataset).
-    Methods:
-        __getitem__(idx) -> (image, label):
-            - Loads and preprocesses a single sample indicated by idx using _preprocess.
-            - Returns a tuple (img, label). The preprocessing step performs OpenCV image
-              read, resizing to resize_size, CLAHE contrast enhancement on the L channel,
-              and a conversion to an image object compatible with torchvision/functional
-              transforms (the implementation uses v2.functional.to_image).
-        collate_fn(batch) -> (cropped_images_tensor, labels_tensor):
-            - Receives a list of samples (img, label) and uses BaseDataset.collate_fn to
-              stack/batch them.
-            - Moves batched tensors to self.device, runs YOLO-based ROI selection via
-              _get_croped_roi, and returns the cropped image tensor and the label tensor.
-            - Note: cropping/inference occurs on the device (GPU if available) for
-              efficiency; this may affect multi-GPU setups.
-        _preprocess(img_path: str) -> PIL.Image | ImageLike:
-            - CPU-side preprocessing for a single image path. Steps:
-                1. Read image from disk with OpenCV (BGR).
-                2. Resize to self.resize_size.
-                3. Convert to Lab color space and apply CLAHE on the L channel.
-                4. Merge channels back and convert to RGB.
-                5. Convert to an image object expected by torchvision functional transforms.
-            - Returns the processed image ready for batching.
-        _get_croped_roi(images: torch.Tensor) -> torch.Tensor:
-            - Performs batched YOLO inference and crops each image to the configured
-              target_size centered on the YOLO-predicted bounding box center.
-            - Expected YOLO output behavior (as used by this method):
-                * Model output is indexed such that:
-                    - x center is at index 0
-                    - y center is at index 1
-                    - object confidence is available at index 4 across anchors/classes
-                * The method selects, per batch item, the anchor/index with maximum
-                  confidence (argmax over output[:, 4, :]) and reads the corresponding
-                  center coordinates.
-            - Steps:
-                1. Convert input images to float32 and scale to [0,1], resize to yolo_size.
-                2. Run the YOLO model in no-grad mode to obtain output tensors.
-                3. For each sample, pick the coordinate pair (x,y) corresponding to the
-                   maximum confidence prediction, map those coordinates from yolo_size
-                   space back to resize_size space, and compute the top-left corner for
-                   cropping using target_size.
-                4. Clamp top/left to be >= 0 to avoid negative crop indices.
-                5. Crop each original (resized) image at the computed top/left with size
-                   target_size using torchvision functional crop and return a batched
-                   tensor of stacked cropped images.
-            - Returns:
-                A torch.Tensor of shape (batch_size, C, target_h, target_w) containing the
-                stacked cropped image tensors.
-    Notes:
-        - This class assumes the DataFrame's "path" entries point to images organized and
-          accessible via the dataset's data_dir / BaseDataset logic.
-        - Cropping occurs in the collate function on the device to leverage GPU inference.
-        - The implementation relies on specific YOLO output indexing; changes to the
-          model's output format will require corresponding updates to _get_croped_roi.
-        - The class depends on BaseDataset for core dataset behaviors (e.g., folder logic),
-          and on torchvision (v2.functional) for conversion, resizing, and cropping ops.
-    """
-    def __init__(self, resize_size: Tuple[int, int], df: pd.DataFrame, data_dir: str):
-        super().__init__(df, data_dir)
-        self.resize_size = resize_size
-
+        
+    def __len__(self):
+        return len(self.df)
+    
     def __getitem__(self, idx):
-        """
-        Retrieves and preprocesses a single sample from the dataset.
-        Args:
-            idx (int): Index of the sample to retrieve.
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: A tuple (img, label) where:
-                - img is the preprocessed image tensor.
-                - label is the corresponding label tensor.
-        """
         img_path = self.df["path"].iloc[idx]
         img = self._preprocess(img_path)
         label = torch.tensor(self.df["label"].iloc[idx])
-        return img, label
 
+        return img, label
+    
     def _preprocess(self, img_path: str):
         """Preprocesses the image by
             Images must be located in subdirectories numbered 0-5 as per _get_folder logic in BaseDataset. applying CLAHE Contrast Enhancement
@@ -245,6 +74,32 @@ class RawDataset(BaseDataset):
         img = v2.functional.to_image(img)
         img = v2.functional.to_dtype(img, torch.float32, scale=True)
         return img
+    
+    def get_sample_weights(self):
+        neg_weight = 1 / len(self.df[self.df["label"] == 0])
+        pos_weight = 1 / len(self.df[self.df["label"] == 1])
+        weights = np.where(self.df["label"] == 1, pos_weight, neg_weight)
+        return torch.tensor(weights).double()
+    
+class GlaucomaDataset(BaseDataset):
+    def __init__(self, df, bbox_df, data_path, resize_size, transform):
+        # Merge predicted bouinding boxes for optic disk
+        super().__init__(df, data_path, resize_size)
+        for c in ["y", "x", "h", "w"]:
+            assert c in bbox_df, \
+                "Columns 'y', 'x', 'w', and 'h' should be in bbox_df"
+        self.df = pd.merge(self.df, bbox_df, on="path")
+        self.transform = transform
+
+    def __getitem__(self, idx):
+        img, label = super().__getitem__(idx)
+        # top, left, height, width = self.df["y"], self.df["x"], self.df["h"], self.df["w"]
+        img = v2.functional.crop(img, self.df["y"].iloc[idx], self.df["x"].iloc[idx],
+                                 self.df["h"].iloc[idx], self.df["w"].iloc[idx])
+
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, label
 
 class CropROITransform(torch.nn.Module):
     def __init__(self, yolo_path: str, yolo_size: Union[int, Tuple[int, int]],
@@ -299,68 +154,76 @@ class CropROITransform(torch.nn.Module):
         self.yolo.to(*args, **kwargs)
         return self
 
-class PrecomputedDataset(RawDataset):
-    def __init__(self, new_df, **kwargs):
-        super().__init__(**kwargs)
-        self.df = pd.merge(self.df, new_df, on="path")
-
-    def __getitem__(self, idx):
-        for c in ["y", "x", "h", "w"]:
-            assert c in self.df.columns, \
-                f"{c} column not in dataframe. Need to call add_box_df method"
-        img, label = super().__getitem__(idx)
-        # top, left, height, width = self.df["y"], self.df["x"], self.df["h"], self.df["w"]
-        img = v2.functional.crop(img, self.df["y"].iloc[idx], self.df["x"].iloc[idx],
-                                 self.df["h"].iloc[idx], self.df["w"].iloc[idx])
-        return img, label
+# typedef
+DatasetTuple = Tuple[GlaucomaDataset, GlaucomaDataset, GlaucomaDataset, Optional[GlaucomaDataset]]
 
 class DataModule:
     def __init__(self, csv_path: str, data_path: str,
-                 resize_size:  Union[int, Tuple[int, int]] = 2_000,
-                 seed: int = 7, precompute: bool = False,
-                 precomputed_filepath: Optional[str] = None,
+                 resize_size:  Union[int, Tuple[int, int]],
+                 val_ratio: float,
+                 test_ratio: float,
+                 include_real: bool,
+                 rec_ratio: float = 0,
+                 seed: int = 7,
+                 bbox_csv: Optional[str] = None,
                  yolo: CropROITransform = None,
-                 n_sample: Union[int, Tuple[int, int, int, int]] = None):
+                 n_sample: Union[int, Tuple[int, int, int, int]] = None,
+                 rec_split: bool = False,
+                 split_index: int = 1,
+                 train_transform: torch.nn.Module = None,
+                 val_transform: torch.nn.Module = None):
         self.csv_path = csv_path
         self.data_path = data_path
         self.resize_size = resize_size if isinstance(resize_size, tuple) else resize_size, resize_size
+        self.val_ratio = val_ratio
+        self.test_ratio = test_ratio
+        self.include_real = include_real
+        self.rec_ratio = rec_ratio
         self.seed = seed
-        self.precompute = precompute
-        self.precomputed_file = precomputed_filepath
+        self.bbox_csv = bbox_csv
         self.yolo = yolo
         self.n_sample = (n_sample,) * 4 if isinstance(n_sample, int) else n_sample
-        # self.n_sample = n_sample if isinstance(n_sample, tuple) or n_sample is None else (n_sample,) * 4
+        self.rec_split = rec_split
+        self.split_index = split_index
+        self.train_transform = train_transform
+        self.val_transform = val_transform
 
-    def load_datasets(self, val_ratio: float = 0.2, test_ratio: float = 0.2,include_real: bool = True) -> Tuple[BaseDataset, BaseDataset, BaseDataset, Optional[BaseDataset]]:
+    def load_datasets(self) -> DatasetTuple:
+        # Load in cdv and split
         df = pd.read_csv(self.csv_path, sep=';')
-        dataframes = self._split_dataframes(df, val_ratio, test_ratio, include_real)
-        train_df, val_df, test_df, real_df = dataframes
-        # Get subset of dataset
-        # If sampling here, may be best to modify dfs to be the expected df
-        # output of the BaseDataset.init
+        dataframes = self._split_dataframes(df, self.val_ratio, self.test_ratio, self.include_real)
+        # Get subset of datasets id needed
         if self.n_sample is not None:
-            n1 , n2 , n3 , n4  = self.n_sample
-            n1 = min(n1, len(train_df)) if n1 is not None else len(train_df)
-            n2 = min(n2, len(val_df)) if n2 is not None else len(val_df)
-            n3 = min(n3, len(test_df)) if n3 is not None else len(test_df)
-            n4 = min(n4, len(real_df)) if n4 is not None else len(real_df)
-            train_df = train_df.sample(n=n1, random_state=self.seed)
-            val_df = val_df.sample(n=n2, random_state=self.seed)
-            test_df = test_df.sample(n=n3, random_state=self.seed)
-            if include_real:
-                real_df = real_df.sample(n=n4, random_state=self.seed)
-        
-        new_df = None
-        if self.precompute:
-            if os.path.exists(self.precomputed_file):
-                new_df = pd.read_csv(self.precomputed_file)
-            else:
-                new_df = self._compute_boxes_df(df)
-                new_df.to_csv(self.precomputed_file, index=False)
-    
-        return self._create_datasets(train_df, val_df, test_df, real_df, new_df,
-                                     resize_size = self.resize_size,
-                                     data_dir = self.data_path)
+            dataframes = [self._get_subset(df, n) for df, n in zip(dataframes, self.n_sample)]
+        train_df, val_df, test_df, real_df = dataframes
+        # Recursively split dataset if needed
+        # Heatmap classifier only trains on validation data
+        # Need train subset and validation subset
+        if self.rec_split:
+            df = dataframes[self.split_index]
+            train_df, val_df, _, _ = self._split_dataframes(df, self.rec_ratio, 0, False)
+
+        # Get precomputed bounding boxes if available
+        # If they aren't, then compute them before training
+        bbox_df = None
+        if os.path.exists(self.bbox_csv):
+            bbox_df = pd.read_csv(self.bbox_csv)
+        else:
+            bbox_df = self._compute_boxes_df(df)
+            bbox_df.to_csv(self.bbox_csv, index=False)
+
+        train = GlaucomaDataset(train_df, bbox_df, self.data_path,
+                                self.resize_size, self.train_transform)
+        val = GlaucomaDataset(val_df, bbox_df, self.data_path,
+                              self.resize_size, self.val_transform)
+        test = GlaucomaDataset(test_df, bbox_df, self.data_path,
+                               self.resize_size, transform=self.val_transform)
+        real = None
+        if self.include_real:
+            real = GlaucomaDataset(real_df, bbox_df, self.data_path,
+                                   self.resize_size, self.val_transform)
+
+        return train, val, test, real
 
     def _split_dataframes(self, df: pd.DataFrame, val_ratio: float, test_ratio: float, include_real: bool) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame]]:
         pos_df = df[df['Final Label'] == "RG"]
@@ -394,18 +257,23 @@ class DataModule:
 
         return train, val, test, real
     
-    def _create_datasets(self, train_df, val_df, test_df, real_df, new_df = None, **kwargs):
-        ds_class = RawDataset
-        if new_df is not None:
-            ds_class = PrecomputedDataset
-            kwargs["new_df"] = new_df
-        train = ds_class(df = train_df, **kwargs)
-        val = ds_class(df = val_df, **kwargs)
-        test = ds_class(df = test_df, **kwargs)
-        real = None
-        if real_df is not None:
-            real = ds_class(df = real_df, **kwargs)
-        return train, val, test, real
+    # Maybe get a weighted subset?
+    # Maybe use Sampler to get subset?
+    def _get_subset(self, df, n):
+        if df is None or n is None:
+            return df
+        # Have 50/50 split
+        # If n is odd then give the extra to negative
+        n_neg = n // 2 + n % 2
+        n_pos = n // 2
+        df_neg = df[df['Final Label'] != "RG"]
+        df_pos = df[df['Final Label'] == "RG"]
+        if len(df_pos) < n_pos:
+            n_neg += n_pos - len(df_pos)
+            n_pos = len(df_pos)
+        df_neg = df_neg.sample(n=n_neg, random_state=self.seed)
+        df_pos = df_pos.sample(n=n_pos, random_state=self.seed)
+        return pd.concat([df_neg, df_pos]).sample(frac=1.0, random_state=self.seed)
 
     def _compute_boxes_df(self, df):
         # Helper Class
@@ -420,8 +288,8 @@ class DataModule:
                 img, _ = self.ds[idx]
                 return idx, img
 
-        assert not os.path.exists(self.precomputed_file), f"{self.precomputed_file} already exists"
-        raw_ds = RawDataset(resize_size=self.yolo.yolo_size, df=df, data_dir=self.data_path)
+        assert not os.path.exists(self.bbox_csv), f"{self.bbox_csv} already exists"
+        raw_ds = BaseDataset(resize_size=self.yolo.yolo_size, df=df, data_path=self.data_path)
         path_ds = PathDataset(raw_ds)
         loader = DataLoader(path_ds, batch_size = 16, num_workers = 8,
                             shuffle = False, pin_memory = True,
@@ -454,12 +322,14 @@ class DataModule:
         new_df = pd.DataFrame(data = rows, columns = columns)
         return new_df
 
-    def get_sampler(self, ds: BaseDataset, oversample: bool,
+    def get_sampler(self, ds: BaseDataset, oversample: bool, num_samples: int = None,
                     replacement: bool = True, use_generator: bool = False):
+        num_samples = num_samples if num_samples is not None else len(ds)
         generator = torch.Generator().manual_seed(self.seed) if use_generator else None
         if oversample:
             weights = ds.get_sample_weights()
-            return WeightedRandomSampler(weights = weights, num_samples = len(weights),
+            return WeightedRandomSampler(weights = weights, num_samples = num_samples,
                                          replacement = replacement, generator = generator)
         else:
-            return RandomSampler(ds, replacement = replacement, generator = generator)
+            return RandomSampler(ds, replacement = replacement,
+                                 num_samples = num_samples, generator = generator)

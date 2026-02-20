@@ -1,0 +1,4 @@
+model:
+  _target_: diffusers.AutoencoderKL.from_pretrained
+  # Can use hf_id or local folder
+  pretrained_model_or_path: "stabilityai/sd-vae-ft-mse"

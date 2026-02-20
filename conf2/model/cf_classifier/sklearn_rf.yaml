@@ -1,0 +1,50 @@
+_target_: src.model.CounterfactualMLCLassifier
+model:
+  _target_: sklearn.ensemble.RandomForestClassifier
+  n_estimators: 100
+  # Pass other arguments to RandomForest here as desired
+
+data:
+  rec_split: false
+  split_index: 100
+  n_sample: [2000, null, null, null]
+  # no augmentations as we are using the diffusion model for inference
+
+
+trainer:
+  _target_: src.trainer.CounterfacturalSklearnTrainer
+  _convert_: partial
+  diffusion_model:
+    # TODO have the ability to load model
+    _target_: src.model.LatentDiffusionModel
+    vae:
+      _target_: src.model.VAE
+      vae:
+        _target_: diffusers.AutoencoderKL.from_pretrained
+        pretrained_model_name_or_path: "stabilityai/sd-vae-ft-mse"
+      # temporary solution to load weights
+      # Add static load method to model classes
+      class_embedder:
+        _target_: src.utils.temp_load_class_embedder
+        model:
+          _target_: src.model.ClassEmbedder
+          num_classes: 2
+          emb_dim: 512
+        path: "models/q5bbm6s4/100/class_embedder.pt"
+      unet:
+        _target_: diffusers.UNet2DConditionModel.from_pretrained
+        pretrained_model_name_or_path: "models/q5bbm6s4/100/
+  classifier: ${model}
+  scheduler:
+    _target_: diffusers.DDIMScheduler
+    num_train_timesteps: 1000
+    # from StableDiffusion which what the architecture is based on
+    beta_start: 0.00085
+    beta_end: 0.012
+    beta_schedule: "scaled_linear"
+    clip_sample: false
+    prediction_type: "epsilon"
+  # Use half training batch size as CFG uses 2x vram for null labels
+  batch_size: 32
+  num_workers: 4
+  inference_hyperparams: ${inference}

@@ -149,6 +149,7 @@ class CounterfactualPipeline(_BasePipeline):
                 "pil", "numpy", and "torch".
         """
         assert output_type in ["torch", "pil", "numpy"], "output_type must be 'torch', 'pil', or 'numpy'"
+        # TODO use batch size to make sure there is no out of memory error
         device = self.unet.device
         images = images.to(device, dtype = self.vae.dtype)
         batch_size = images.size(0)

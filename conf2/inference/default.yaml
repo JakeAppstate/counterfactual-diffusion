@@ -1,0 +1,4 @@
+num_inference_steps: 100
+guidance_scale: 3.0
+percent_steps: 0.3
+use_dn: true

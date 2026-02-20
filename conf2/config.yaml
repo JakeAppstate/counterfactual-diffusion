@@ -1,0 +1,19 @@
+const:
+  v2: torchvision.transforms.v2
+
+defaults:
+  - data: default
+  - inference: default
+  - model: diffusion/default
+  # - inference: orig
+  - _self_
+  - override hydra/hydra_logging: disabled
+  - override hydra/job_logging: disabled
+hydra:
+  output_subdir: null
+  run:
+    dir: .
+
+seed: 7
+project_name: "Glaucoma Counterfactual Diffusion"
+

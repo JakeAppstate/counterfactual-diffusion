@@ -1,0 +1,80 @@
+model:
+  _target_: src.model.CounterfactualTorchClassifier
+  # Currently no other args
+
+data:
+  rec_split: true
+  split_index: 1
+  rec_ratio: 0.5
+  # TODO maybe want to undersample so that class proportions are equal?
+  n_sample: [null, null, null, null]
+  oversample: false
+  # no augmentations as we are using the diffusion model for inference
+
+threshold: 0.5
+class_names:
+  - "NRG"
+  - "RG"
+metrics:
+  # Used custom resolver specified in main.py
+  # Usage: ${metric:[sklearn metric name or function path], threshold, switch_args, is_wandb, kwargs}
+  accuracy: ${metric:accuracy_score, ${..threshold}}
+  balanced_accuracy: ${metric:balanced_accuracy_score, ${..threshold}}
+  precision: ${metric:precision_score, ${..threshold}}
+  recall: ${metric:recall_score, ${..threshold}}
+  f1_score: ${metric:f1_score, ${..threshold}}
+  roc_auc: ${metric:roc_auc_score}
+  roc_curve: ${metric:wandb.plot.roc_curve, null, false, true, {labels:${..class_names}}}
+  pr_curve: ${metric:wandb.plot.pr_curve, null, false, true, {labels:${..class_names}}}
+  confusion_matrix: ${metric:wandb.plot.confusion_matrix, null, true, true, {class_names:${..class_names}}}
+
+trainer:
+  _target_: src.train.CounterfactualTorchTrainer
+  _convert_: partial
+  model: ${model.model}
+  diffusion_model:
+    _target_: src.model.LatentDiffusionModel
+    vae:
+      _target_: src.model.VAE
+      model:
+        _target_: diffusers.AutoencoderKL.from_pretrained
+        pretrained_model_name_or_path: "stabilityai/sd-vae-ft-mse"
+    class_embedder:
+      _target_: src.utils.temp_load_class_embedder
+      model:
+        _target_: src.model.ClassEmbedder
+        num_classes: 2
+        emb_dim: 512
+      path: "models/q5bbm6s4/100/class_embedder.pt"
+    unet:
+      _target_: diffusers.UNet2DConditionModel.from_pretrained
+      pretrained_model_name_or_path: "models/q5bbm6s4/060/"
+  scheduler:
+    _target_: diffusers.DDIMScheduler
+    num_train_timesteps: 1000
+    # from StableDiffusion which what the architecture is based on
+    beta_start: 0.00085
+    beta_end: 0.012
+    beta_schedule: "scaled_linear"
+    clip_sample: false
+    prediction_type: "epsilon"
+  inference_hyperparams: ${inference}
+  optimizer_fun:
+    _target_: src.utils.get_optimizer
+    classname: 
+      _target_: torch.optim.AdamW
+      _partial_: true
+    lr: 1e-4
+    weight_decay: 0.01
+  num_epochs: 40
+  batch_size: 32
+  num_workers: 4
+  mixed_precision: "bf16"
+  precompute_train: true
+  precompute_val: true
+  metrics: "${..metrics}"
+  calculate_metrics: true
+  seed: "${seed}"
+  num_save_epochs: 5
+  save_path: "models/mobilenet_v2"
+
