@@ -36,7 +36,7 @@ trainer:
     _target_: src.model.LatentDiffusionModel
     vae:
       _target_: src.model.VAE
-      model:
+      vae:
         _target_: diffusers.AutoencoderKL.from_pretrained
         pretrained_model_name_or_path: "stabilityai/sd-vae-ft-mse"
     class_embedder:
@@ -49,29 +49,30 @@ trainer:
     unet:
       _target_: diffusers.UNet2DConditionModel.from_pretrained
       pretrained_model_name_or_path: "models/q5bbm6s4/060/"
-  scheduler:
-    _target_: diffusers.DDIMScheduler
-    num_train_timesteps: 1000
-    # from StableDiffusion which what the architecture is based on
-    beta_start: 0.00085
-    beta_end: 0.012
-    beta_schedule: "scaled_linear"
-    clip_sample: false
-    prediction_type: "epsilon"
+    scheduler:
+      _target_: diffusers.DDIMScheduler
+      num_train_timesteps: 1000
+      # from StableDiffusion which what the architecture is based on
+      beta_start: 0.00085
+      beta_end: 0.012
+      beta_schedule: "scaled_linear"
+      clip_sample: false
+      prediction_type: "epsilon"
   inference_hyperparams: ${inference}
   optimizer_fun:
     _target_: src.utils.get_optimizer
-    classname: 
+    optimizer_init:
       _target_: torch.optim.AdamW
       _partial_: true
     lr: 1e-4
     weight_decay: 0.01
+  loss:
+    _target_: torch.nn.BCEWithLogitsLoss
   num_epochs: 40
   batch_size: 32
   num_workers: 4
   mixed_precision: "bf16"
-  precompute_train: true
-  precompute_val: true
+  precompute: true
   metrics: "${..metrics}"
   calculate_metrics: true
   seed: "${seed}"

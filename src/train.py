@@ -7,21 +7,23 @@ import os
 from cv2 import medianBlur
 import numpy as np
 import matplotlib.pyplot as plt
+import sklearn
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, roc_auc_score, \
                             f1_score, precision_score, recall_score
-from diffusers import SchedulerMixin, DDIMScheduler
+from diffusers import DDPMScheduler, DDIMScheduler, EMAModel
 import wandb
-from torch.utils.data import Dataset, TensorDataset, DataLoader, Sampler
+from torch.utils.data import Dataset, TensorDataset, DataLoader, Sampler, Subset
 import torch
 from tqdm import tqdm
 
 import src.model
-from src.inference import ImageGenerationPipeline, CounterfactualPipeline
 from src.utils import create_grid, create_counterfactual_grid
 
 # Custom Types
 Metrics = Dict[str, Callable[[float, float], float]]
-TorchModel = src.model.TorchModelInterface
+# pylint: disable-next=missing-class-docstring
+class TorchModel(src.model.ModelInterface, torch.nn.Module):
+    pass
 # loss, pred, label
 TrainStepReturn = Tuple[float, torch.Tensor, torch.Tensor]
 OptimizerFun = Callable[[Union[List[Tuple[str, Iterator]], Iterator]], torch.optim.Optimizer]
@@ -37,21 +39,21 @@ class TrainerInterface(ABC):
         pass
 
     @abstractmethod
-    def evaluate(self, ds, sampler, epoch = None):
+    def evaluate(self, ds, sampler):
         pass
 
 class TorchTrainer(TrainerInterface):
     def __init__(self, model: TorchModel, num_epochs: int, optimizer_fun: OptimizerFun,
-                 batch_size: int, num_workers: int, mixed_precision: str,
-                 precompute_train: bool, precompute_val: bool, metrics: Metrics,
+                 loss: torch.nn.Module, batch_size: int, num_workers: int, mixed_precision: str,
+                 precompute: bool, metrics: Metrics,
                  calculate_metrics: bool, seed: int, num_save_epochs: int, save_path: str):
         self.model = model
         self.num_epochs = num_epochs
+        self.loss = loss
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.mixed_precision = mixed_precision
-        self.precompute_train = precompute_train
-        self.precompute_val = precompute_val
+        self.precompute = precompute
         self.metrics = metrics
         self.calculate_metrics = calculate_metrics
         self.seed = seed
@@ -79,11 +81,11 @@ class TorchTrainer(TrainerInterface):
     def _precompute(self, dataloader: DataLoader) -> Dataset:
         return None
 
-    def _load_dataloader(self, ds: Dataset, sampler: Sampler, precompute: bool = False) -> DataLoader:
+    def _load_dataloader(self, ds: Dataset, sampler: Sampler) -> DataLoader:
         data = DataLoader(ds, batch_size = self.batch_size, shuffle = False,
                            num_workers = self.num_workers, pin_memory = True,
                            sampler = sampler)
-        if precompute:
+        if self.precompute:
             # _precompute might not be implemented and return None
             ds = self._precompute(data) or ds
             data = DataLoader(ds, batch_size = self.batch_size, shuffle = False,
@@ -94,17 +96,17 @@ class TorchTrainer(TrainerInterface):
     def train(self, train_ds: Dataset, val_ds: Dataset, train_sampler: Sampler, val_sampler: Sampler):
         self.model.train()
         self.model.to(self.device)
-        train = self._load_dataloader(train_ds, train_sampler, self.precompute_train)
-        val = self._load_dataloader(val_ds, val_sampler, self.precompute_val)
+        train = self._load_dataloader(train_ds, train_sampler)
+        val = self._load_dataloader(val_ds, val_sampler)
         global_step = 0
         for epoch in range(1, self.num_epochs + 1):
             pred_list = []
             target_list = []
             print("Starting epoch:", epoch)
             for images, labels in tqdm(train):
-                images = images.to(self.device, non_blocking = True).to(self.dtype)
+                images = images.to(self.device, non_blocking = True)
                 labels = labels.to(self.device, non_blocking = True)
-                loss, pred, target = self._train_step(images, labels)
+                loss, pred, target = self._train_step((images,), labels)
                 wandb.log({
                     "epoch": epoch,
                     "global_step": global_step,
@@ -129,9 +131,23 @@ class TorchTrainer(TrainerInterface):
                 os.makedirs(save_path, exist_ok=True)
                 self.model.save(save_path)
 
-    @abstractmethod
-    def _train_step(self, images: torch.Tensor, labels: torch.Tensor, training: bool = True) -> TrainStepReturn:
-        pass
+    def _train_step(self, x: Tuple[torch.Tensor, ...], y: torch.Tensor, training: bool = True) -> TrainStepReturn:
+        self.optimizer.zero_grad()
+        with torch.amp.autocast(self.device_str, dtype = self.dtype,
+                                enabled = (self.mixed_precision in ["bf16", "fp16"])):
+            pred = self.model(*x)
+            loss = self.loss(pred, y)
+        if training and self.scaler is not None:
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        elif training:
+            loss.backward()
+            self.optimizer.step()
+        # Don't return predictions and labels if they are not being used
+        if not self.calculate_metrics:
+            return loss.item(), None, None
+        return loss.item(), pred.detach().cpu().float(), y.cpu()
     
     @torch.no_grad()
     def _evaluate(self, dataloader: DataLoader, epoch: int):
@@ -142,32 +158,33 @@ class TorchTrainer(TrainerInterface):
         loss_acc = 0.0
         i = 0
         for images, labels in tqdm(dataloader):
-            images = images.to(self.device, non_blocking = True).to(self.dtype)
+            images = images.to(self.device, non_blocking = True)
             labels = labels.to(self.device, non_blocking = True)
-            loss, pred, target = self._train_step(images, labels, training = False)
+            loss, pred, target = self._train_step((images,), labels, training = False)
             if self.calculate_metrics:
                 pred_list.append(pred)
                 target_list.append(target)
             loss_acc += loss
             i += 1
         loss = loss_acc / i
+        metrics = {}
         if self.calculate_metrics:
             preds = torch.cat(pred_list).numpy()
             targets = torch.cat(target_list).numpy()
             metrics = self._calculate_metrics(preds, targets)
             metrics = {f"val_{k}": v for k, v in metrics.items()}
-            metrics["val_loss"] = loss
-            if epoch is not None:
-                metrics["epoch"] = epoch
-            wandb.log(metrics)
+        metrics["val_loss"] = loss
+        if epoch is not None:
+            metrics["epoch"] = epoch
+        wandb.log(metrics)
         #pylint:disable-next=expression-not-assigned
         self.model.train() if train_mode else self.model.eval()
         return metrics
     
     @torch.no_grad()
-    def evaluate(self, ds: Dataset, sampler: Sampler, epoch: int = None):
+    def evaluate(self, ds: Dataset, sampler: Sampler):
         data = self._load_dataloader(ds, sampler)
-        return self._evaluate(data, epoch)
+        return self._evaluate(data, None)
         
     def _calculate_metrics(self, pred: np.array, target: np.array):
         metrics = {}
@@ -177,8 +194,8 @@ class TorchTrainer(TrainerInterface):
 
 # TODO Modify code to match new dataloader code in parent class
 class DiffusionTrainer(TorchTrainer):
-    def __init__(self, scheduler: SchedulerMixin, p_label_dropout: float,
-                 num_inference_steps: int, num_generate: int, num_counterfactual: int, 
+    def __init__(self, p_label_dropout: float, num_inference_steps: int,
+                 ema_decay: float, num_generate: int, num_counterfactual: int,
                  guidance_scale: float, use_dn: bool, percent_steps: float, **kwargs):
         # Dont initalizer optimizer just yet
         # Want to pass parameter groups and remove VAE
@@ -192,14 +209,22 @@ class DiffusionTrainer(TorchTrainer):
             Can implenent custom metrics on generated or counterfactual images in evaluate if needed."
         super().__init__(**kwargs)
         self.p_label_dropout = p_label_dropout
-        self.scheduler = scheduler
         self.num_inference_steps = num_inference_steps
         self.num_generate = num_generate
         self.num_counterfactual = num_counterfactual
+        # TODO may want to bundle into inference dict and unpack when calling model
         self.guidance_scale = guidance_scale
         self.use_dn = use_dn
         self.percent_steps = percent_steps
+        self.scheduler = DDPMScheduler.from_config(self.model.scheduler.config)
+        self.cf_data = None
 
+        self.ema_model = EMAModel(
+            self.model.unet.parameters(),
+            decay = ema_decay,
+            model_cls = type(self.model.unet),
+            model_config = self.model.unet.config
+        )
         params = [
             (ParameterGroupNames.CLASS_EMBEDDER.value, self.model.class_embedder.parameters()),
             (ParameterGroupNames.UNET.value, self.model.unet.parameters())
@@ -230,97 +255,91 @@ class DiffusionTrainer(TorchTrainer):
         self.model.vae.to("cpu")
         torch.cuda.empty_cache()
         return new_dataset
+    
+    def train(self, train_ds, val_ds, train_sampler, val_sampler):
+        self.cf_data = self._get_counterfactual_dataset(val_ds)
+        super().train(train_ds, val_ds, train_sampler, val_sampler)
 
-    def _train_step(self, images: torch.Tensor, labels: torch.Tensor, training: bool = True) -> float:
+    def _train_step(self, x, y, training = True):
         # Device locations should be okay for training
         # TODO verify
-        precompute_latents = self.precompute_train if training else self.precompute_val
-        latents = images if precompute_latents else self.model.vae.encode(images)
-        timesteps = torch.randint(0, self.scheduler.config.num_train_timesteps,
+        images, = x
+        latents = images if self.precompute else self.model.vae.encode(images)
+        timesteps = torch.randint(0, self.scheduler.config["num_train_timesteps"],
                                   (images.size(0),), device = self.device)
         noise = torch.randn_like(latents)
         noisy_latents = self.scheduler.add_noise(latents, noise, timesteps)
         if self.p_label_dropout > 0:
-            drop_mask = torch.rand(labels.shape, device = self.device) < self.p_label_dropout
-            labels = labels.masked_fill(drop_mask, self.model.class_embedder.null_class_label)
-        self.optimizer.zero_grad()
-        with torch.amp.autocast(self.device_str, dtype = self.dtype,
-                                enabled = (self.mixed_precision in ["bf16", "fp16"])):
-            class_embeddings = self.model.class_embedder(labels)
-            noise_pred = self.model.unet(noisy_latents, timesteps,
-                                   encoder_hidden_states = class_embeddings).sample
-            loss = torch.nn.functional.mse_loss(noise_pred, noise)
-        if training and self.scaler is not None:
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-        elif training:
-            loss.backward()
-            self.optimizer.step()
+            drop_mask = torch.rand(y.shape, device = self.device) < self.p_label_dropout
+            y = y.masked_fill(drop_mask, self.model.class_embedder.null_class_label)
+        loss, _, _ = super()._train_step((noisy_latents, timesteps, y), noise, training)
         # Don't want to save target and prediction as they are full sized images
-        return loss.item(), None, None
+        return loss, None, None
     
     def _generate_images(self):
         generator = torch.Generator(self.device).manual_seed(self.seed)
         classes = [0, 1, self.model.class_embedder.null_class_label]
         labels = torch.tensor(classes * self.num_generate, device = self.device)
-        new_images = self.model.generate(labels, self.num_inference_steps, self.guidance_scale, rescale = True, generator = generator)
+        new_images = self.model.generate(labels, self.num_inference_steps, self.guidance_scale, rescale = True, generator = generator, log = True)
         np_images = new_images.cpu().permute(0, 2, 3, 1).numpy()
         label_names = ["NRG", "RG", "Null"]
         fig = create_grid(np_images, col_names = [label_names[c] for c in classes])
         return fig
     
-    def _get_counterfactuals(self, val: DataLoader):
-        val = iter(val)
+    def _get_counterfactual_dataset(self, ds):
         n_neg, n_pos = 0, 0
         neg_list, pos_list = [], []
         N = self.num_counterfactual
-        done = False
-        for batch in val:
-            for img, label in zip(batch):
-                if label == 0 and n_neg < N:
-                    neg_list.append(img)
-                    n_neg += 1
-                elif label == 1 and n_pos < N:
-                    pos_list.append(img)
-                    n_pos += 1
-                if n_neg >= N and n_pos >= N:
-                    done = True
-                    break
-            if done:
-                break
-        images = torch.stack(neg_list + pos_list).to(self.device)
+        i = 0
+        while n_neg < N or n_pos < N:
+            img, label = ds[i]
+            if label == 1 and n_pos < N:
+                pos_list.append(img)
+                n_pos += 1
+            elif label == 0 and n_neg < N:
+                neg_list.append(img)
+                n_neg += 1
+            i += 1
+        images = torch.stack(neg_list + pos_list)
         labels = torch.tensor([0] * N + [1] * N)
-        scheduler = DDIMScheduler.from_config(self.scheduler.config)
-        counterfactuals = self.model.get_counterfactual(images, scheduler,
+        return images, labels
+
+    def _get_counterfactuals(self, data: Tuple[torch.Tensor, torch.Tensor]):
+        images, labels = data
+        counterfactuals = self.model.get_counterfactual(images,
                                                         num_inference_steps = self.num_inference_steps,
                                                         guidance_scale = self.guidance_scale,
                                                         percent_steps = self.percent_steps,
-                                                        use_dn = self.use_dn,
-                                                        rescale = True)
+                                                        use_dn = self.use_dn, rescale = True,
+                                                        log = True)
         orig, new, heatmap = (x.cpu().permute(0, 2, 3, 1).numpy() for x in counterfactuals)
         fig = create_counterfactual_grid(orig, new, heatmap, labels)
         return fig
     
     def _evaluate(self, dataloader: DataLoader, epoch: int):
         super()._evaluate(dataloader, epoch)
-        if epoch % self.num_save_epochs == 0 or epoch == self.num_epochs:
+        if epoch % self.num_save_epochs == 0 or epoch == self.num_epochs or epoch == 1:
+            if self.precompute:
+                self.model.vae.to(self.device)
             gen_fig = self._generate_images()
-            cf_fig = self._get_counterfactuals(dataloader)
+            cf_fig = self._get_counterfactuals(self.cf_data)
             wandb.log({
                 "epoch": epoch,
                 "Generated Images": wandb.Image(gen_fig),
                 "Counterfactual Images": wandb.Image(cf_fig)
             })
+            plt.close()
             self.model.save(os.path.join(self.save_path, wandb.run.id, f"{epoch:3d}"))
+            if self.precompute:
+                self.model.vae.to("cpu")
+                torch.cuda.empty_cache()
         
 
 class CounterfactualTorchTrainer(TorchTrainer):
-    def __init__(self, diffusion_model: src.model.LatentDiffusionModel, scheduler: DDIMScheduler, inference_hyperparams: dict, **kwargs):
+    def __init__(self, diffusion_model: src.model.LatentDiffusionModel, inference_hyperparams: dict, **kwargs):
         super().__init__(**kwargs)
         diffusion_model.eval()
         self.diffusion_model = diffusion_model
-        self.scheduler = scheduler
         self.inference_hyperparams = inference_hyperparams
 
     def _precompute(self, dataloader: DataLoader):
@@ -332,7 +351,7 @@ class CounterfactualTorchTrainer(TorchTrainer):
         print("Precomputing heatmaps...")
         for img, label in tqdm(dataloader):
             img = img.to(self.device)
-            _, _, hm = self.diffusion_model.get_counterfactual(img, self.scheduler, rescale = True, **self.inference_hyperparams)
+            _, _, hm = self.diffusion_model.get_counterfactual(img, rescale = True, **self.inference_hyperparams)
             if not logged:
                 hm_numpy = hm.permute((0, 2, 3, 1)).numpy()
                 wandb.log({
@@ -349,100 +368,38 @@ class CounterfactualTorchTrainer(TorchTrainer):
         torch.cuda.empty_cache()
         return new_dataset
     
-    # TODO Can probably factor this code out and put it in TorchTrainer _train_step
     def _train_step(self, images, labels, training = True):
-        self.optimizer.zero_grad()
-        with torch.amp.autocast(self.device_str, dtype = self.dtype,
-                                enabled = (self.mixed_precision in ["bf16", "fp16"])):
-            preds = self.model(images)
-            loss = torch.nn.functional.binary_cross_entropy_with_logits(preds, labels.float())
-        if training and self.scaler is not None:
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-        elif training:
-            loss.backward()
-            self.optimizer.step()
-        return loss, preds.detach().cpu().float(), labels.cpu()
+        labels = labels.float()
+        return super()._train_step(images, labels, training)
 
-class CounterfacturalSklearnTrainer(TrainerInterface):
-    def __init__(self, diffusion_model: src.model.LatentDiffusionModel, classifier,
-                 scheduler: DDIMScheduler, batch_size: int, num_workers: int, inference_hyperparams: dict):
-        self.diffusion_model = diffusion_model
-        self.classifier = classifier
-        self.scheduler = scheduler
-
-        self.batch_size = batch_size
-        self.num_workers = num_workers
-        self.inference_hyperparams = inference_hyperparams
-        self.device_str = "cuda" if torch.cuda.is_available() else "cpu"
-        self.device = torch.device(self.device_str)
     
-    @torch.no_grad()
-    def _get_heatmaps(self, img_batch):
-        # TODO Bundle scheduler with LatentDiffusionModel and save scheduler with model
-        # TODO move inference hyperparams to own section in config
-        # TODO finish method
-        scheduler = self.scheduler
-        return self.diffusion_model.get_counterfactual(img_batch, scheduler, rescale=True, **self.inference_hyperparams)
+class CrossValidationTrainer(TrainerInterface):
+    def __init__(self,  trainers: List[TrainerInterface],
+                 n_folds: int, seed: int):
+        self.trainers = trainers
+        self.n_folds = n_folds
+        self.seed = seed
 
-    def _calculate_metrics(self, y_probs: np.ndarray, y: np.ndarray, threshold = 0.5):
-        # accuracy_score, balanced_accuracy_score, roc_auc_score, f1_score, \
-        #                     precision_score, recall_score
-        y_pred = (y_probs >= threshold).astype(int)
-        metrics = {}
-        metrics["Accuracy"] = accuracy_score(y, y_pred)
-        metrics["Balanced Accuracy"] = balanced_accuracy_score(y, y_pred)
-        metrics["ROC-AUC"] = roc_auc_score(y, y_probs)
-        metrics["F1 score"] = f1_score(y, y_pred)
-        metrics["Specificity"] = precision_score(y, y_pred)
-        metrics["Sensitivity"] = recall_score(y, y_pred)
-        # TODO add sensitivity at 95% specificity
-        # TODO: should be a parameter to init or obtained from dataset
-        CLASS_NAMES = ["NRG", "RG"]
-        metrics["Confusion Matrix"] = wandb.plot.confusion_matrix(preds = y_pred, y_true = y,
-                                                                  class_names=CLASS_NAMES)
-        metrics["ROC Curve"] = wandb.plot.roc_curve(y, y_probs, CLASS_NAMES)
-        metrics["PR Curve"] = wandb.plot.pr_curve(y, y_probs, CLASS_NAMES)
-
-        wandb.log(metrics)
-    
-    def _get_data(self, ds, sampler):
-        self.diffusion_model.to(self.device)
-        dataloader = DataLoader(ds, batch_size=self.batch_size, shuffle=False,
-                       num_workers=self.num_workers, pin_memory=True, sampler = sampler)
-        X = []
-        y = []
-        for img, label in dataloader:
-            hm = self._get_heatmaps(img)
-            # Convert to numpy on batch to reduce memory useage
-            X = self.classifier.get_features(hm)
-            y = label.cpu().numpy()
-            X.append(X)
-            y.append(y)
-
-        # pylint: disable-next=invalid-name
-        X = np.concatenate(X, axis=0)
-        y = np.concatenate(y)
-        return X, y
+    def _get_folds(self, ds):
+        folds = []
+        y = ds.get_targets()
+        X = np.zeros_like(y)
+        strat_kfold = sklearn.model_selection.StratifiedKFold(n_splits=self.n_folds,
+                                                              random_state = self.seed)
+        for train_idx, val_idx in strat_kfold.split(X, y):
+            train = Subset(ds, train_idx)
+            val = Subset(ds, val_idx)
+            folds.append((train, val))
+        return folds
     
     def train(self, train_ds, val_ds, train_sampler, val_sampler):
-        X, y = self._get_data(train_ds, train_sampler)
+        folds = self._get_folds(train_ds)
+        for trainer in self.trainers:
+            for i, (train, val) in enumerate(folds):
+                trainer.save_path = os.path.join(trainer.save_path, f"fold{i}")
+                trainer.train(train, val, train_sampler, val_sampler)
 
-        self.classifier.fit(X, y)
-
-        # Training metrics
-        y_probs = self.classifier.model.predict_proba(X)
-        self._calculate_metrics(y_probs, y)
-        
-        # Validation metrics
-        val_metrics = self.evaluate(val_ds, val_sampler)
-        val_metrics = {f"val_{key}": val for key, val in val_metrics.items()}
-        wandb.log(val_metrics)
-
-    def evaluate(self, ds, sampler, epoch=None):
-        X, y = self._get_data(ds, sampler)
-        y_probs = self.classifier(X)
-        self._calculate_metrics(y_probs, y)
-        return (y_probs >= 0.5).astype(int)
+    def evaluate(self, ds, sampler, epoch = None):
+        for trainer in self.trainers:
+            trainer.evaluate(ds, sampler, epoch)
     

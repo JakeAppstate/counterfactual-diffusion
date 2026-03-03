@@ -1,0 +1,22 @@
+data:
+  rec_split: false
+  # Do not want to split the data recursively, if it does occur, using a value of 100 should throw an error
+  split_index: 100
+  rec_ratio: 0
+  n_sample: [null, null, null, null]
+  augmentations:
+    _target_: ${const.v2}.Compose
+    transforms:
+      - _target_: ${const.v2}.RandomHorizontalFlip
+        p: 0.5
+      - _target_: ${const.v2}.ColorJitter
+        brightness: 0.1
+        contrast: 0.1
+        saturation: 0.1
+        hue: 0
+
+trainer:
+  _target_: src.train.CrossValidationTrainer
+  trainers:
+    -
+      _target_: src.train.DiffusionTrainer

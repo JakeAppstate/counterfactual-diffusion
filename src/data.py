@@ -81,6 +81,9 @@ class BaseDataset(Dataset):
         weights = np.where(self.df["label"] == 1, pos_weight, neg_weight)
         return torch.tensor(weights).double()
     
+    def get_labels(self):
+        return self.df["label"].to_numpy()
+    
 class GlaucomaDataset(BaseDataset):
     def __init__(self, df, bbox_df, data_path, resize_size, transform):
         # Merge predicted bouinding boxes for optic disk
@@ -157,6 +160,8 @@ class CropROITransform(torch.nn.Module):
 # typedef
 DatasetTuple = Tuple[GlaucomaDataset, GlaucomaDataset, GlaucomaDataset, Optional[GlaucomaDataset]]
 
+# TODO can probably refactor some of the code to be cleaner
+# Could use torch.utils.data.Subset and sklearn.model_selection.train_test_split
 class DataModule:
     def __init__(self, csv_path: str, data_path: str,
                  resize_size:  Union[int, Tuple[int, int]],

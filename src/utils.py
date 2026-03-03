@@ -102,27 +102,27 @@ def plot_counterfactual_hyperparams(images, labels, pipeline, hyperparams, defau
     return figs
 
 # TODO add option for passing model.parameters() instead of param groups
-def get_optimizer(classname, **kwargs):
+def get_optimizer(optimizer_init, **kwargs):
     param_groups = kwargs.pop("param_groups", None)
     def build(params: Union[List[Tuple[str, Iterator]], Iterator]):
         # model.parameters() is passed
         if isinstance(params, Iterator):
             # only include trainiable weights
             params = (p for p in params if p.requires_grad)
-            return classname(params = params, **kwargs)
+            return optimizer_init(params = params, **kwargs)
         # List of (name, param) pairs are passed
         if param_groups is None:
             # Parameter groups are not defined. Use defaults for all parameters
             # Convert list of (name, param) pairs to iter of params
             params = (p for _, param in params for p in param if p.requires_grad)
-            return classname(params = params, **kwargs)
+            return optimizer_init(params = params, **kwargs)
         # Parameter groups exist in config and are passed
         for name, param in params:
             if name not in param_groups:
                 raise ValueError(f"Missing parameter group {name} in config")
             param = (p for p in param if p.requires_grad)
             param_groups[name].params = param
-        return classname(params = param_groups, **kwargs)
+        return optimizer_init(params = param_groups, **kwargs)
     return build
 
 def temp_load_class_embedder(model, path):

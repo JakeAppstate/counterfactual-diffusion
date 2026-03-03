@@ -22,9 +22,6 @@ class ModelInterface(ABC):
 
     # TODO add load method
 
-class TorchModelInterface(nn.Module, ModelInterface):
-    pass
-
 class ClassEmbedder(nn.Module, ModelInterface):
     def __init__(self, num_classes: int, emb_dim: int):
         super().__init__()
@@ -48,9 +45,9 @@ class ClassEmbedder(nn.Module, ModelInterface):
                    os.path.join(save_path, "class_embedder.pt"))
         
 class VAE(nn.Module, ModelInterface):
-    def __init__(self, model: AutoencoderKL):
+    def __init__(self, vae: AutoencoderKL):
         super().__init__()
-        self.vae = model
+        self.vae = vae
         
     def forward(self, *args):
         assert len(args) == 1
@@ -76,7 +73,8 @@ class VAE(nn.Module, ModelInterface):
         self.vae.save_pretrained(save_path)
 
 class LatentDiffusionModel(nn.Module, ModelInterface):
-    def __init__(self, vae: VAE, class_embedder: ClassEmbedder, unet: UNet2DConditionModel):
+    def __init__(self, vae: VAE, class_embedder: ClassEmbedder,
+                 unet: UNet2DConditionModel, scheduler: DDIMScheduler):
         super().__init__()
         vae = vae.eval()
         # Freeze parameters of vae
@@ -85,12 +83,13 @@ class LatentDiffusionModel(nn.Module, ModelInterface):
         self.vae = vae
         self.class_embedder = class_embedder
         self.unet = unet
+        self.scheduler = scheduler
 
     def forward(self, *args):
         assert len(args) == 3
         latents, timesteps, labels = args
         class_embeddings = self.class_embedder(labels)
-        noise_pred = self.unet(latents, timesteps, encoder_hidden_states = class_embeddings)
+        noise_pred = self.unet(latents, timesteps, encoder_hidden_states = class_embeddings).sample
         return noise_pred
 
     def _dynamic_normalization(self, img, p = 0.99):
@@ -104,6 +103,7 @@ class LatentDiffusionModel(nn.Module, ModelInterface):
         q = q.unsqueeze(-1).expand(img.shape)
         return torch.clamp(img, -q, q)
     
+    # TODO Might should use forward method instead of calling sub models?
     @torch.no_grad()
     def _sample(self, latents, labels, scheduler,
                 num_inference_steps = 100, guidance_scale = 0,
@@ -140,7 +140,7 @@ class LatentDiffusionModel(nn.Module, ModelInterface):
         return torch.clamp((img + 1) / 2, 0, 1)
     
     # TODO Have option to disable logging
-    def genereate(self, labels, num_inference_steps, guidance_scale, rescale = False, generator = None):
+    def generate(self, labels, num_inference_steps, guidance_scale, rescale = False, generator = None, log = True):
         batch_size = labels.shape[0]
         # self.device should exist but self.device throws an eror
         # not sure why this is the case
@@ -159,23 +159,22 @@ class LatentDiffusionModel(nn.Module, ModelInterface):
         # TODO may want to change use_dn to false for generating images
         # Should run test to compare
         print("Generating Images...")
-        latents = self._sample(latents, labels, num_inference_steps, guidance_scale, use_dn = False)
+        latents = self._sample(latents, labels, self.scheduler, num_inference_steps, guidance_scale, use_dn = False, log = log)
         # Decode latents to images
-        latents = 1 / self.vae.config.scaling_factor * latents
-        # latents = latents.to(self.vae.dtype) # If using mixed precision
-        images = self.vae.decode(latents).sample
-        images = images.to(torch.float32).cpu()
+        images = self.vae.decode(latents)
+        images = images.cpu().float()
         if rescale:
             images = self._rescale(images)
         return images
 
     # TODO Have option to disable logging
     @torch.no_grad
-    def get_counterfactual(self, images, scheduler, num_inference_steps, guidance_scale = 3.0,
-                           percent_steps = 1.0, use_dn = True, rescale = False, log = False):
+    def get_counterfactual(self, images, num_inference_steps, guidance_scale = 3.0,
+                           percent_steps = 1.0, use_dn = True, rescale = False,
+                           log = False):
         # Get forward and reverse scheduler
-        reverse_scheduler = DDIMInverseScheduler.from_config(scheduler.config)
-        forward_scheduler = DDIMScheduler.from_config(scheduler.config)
+        reverse_scheduler = DDIMInverseScheduler.from_config(self.scheduler.config)
+        forward_scheduler = self.scheduler
         
         # TODO verify assumption that images are already on the same device as VAE
         device = self.unet.device
@@ -183,7 +182,9 @@ class LatentDiffusionModel(nn.Module, ModelInterface):
 
         idx = int(np.ceil(percent_steps * num_inference_steps))
 
+        images = images.to(self.vae.device)
         latents = self.vae.encode(images)
+        images = images.cpu() # remove images from gpu to save vram
         latents = latents.to(device, dtype = self.unet.dtype)
         # latents = latents.to(self.unet.dtype)
         # Backwards Process: x_0 -> x_T
@@ -201,8 +202,8 @@ class LatentDiffusionModel(nn.Module, ModelInterface):
         latents = self._sample(latents, healthy_labels, forward_scheduler, num_inference_steps,
                                guidance_scale=guidance_scale, use_dn=use_dn, start_idx=-idx, log = log)
         # Decode latents to images
-        new_images = self.vae.decode(latents).to(images.dtype).float().cpu()
-        heatmap = torch.mean(torch.abs(new_images - images.cpu()), dim=1, keepdim=True)
+        new_images = self.vae.decode(latents).float().cpu()
+        heatmap = torch.mean(torch.abs(new_images - images), dim=1, keepdim=True)
         # new_images = torch.clamp((new_images + 1) / 2, 0, 1).cpu() # scale to [0, 1]
         # convert to output format
         heatmap = heatmap.to(torch.float32)
