@@ -1,6 +1,6 @@
 #pylint: disable=E0401
 from enum import Enum
-from typing import List, Dict, Tuple, Union, Iterator, TypeVar
+from typing import List, Dict, Tuple, Union, Iterator
 from collections.abc import Callable
 from abc import ABC, abstractmethod
 import os
@@ -18,6 +18,7 @@ from tqdm import tqdm
 
 import src.model
 from src.utils import create_grid, create_counterfactual_grid
+from src.data import MapDataset
 
 # Custom Types
 Metrics = Dict[str, Callable[[float, float], float]]
@@ -329,7 +330,6 @@ class DiffusionTrainer(TorchTrainer):
                 "Counterfactual Images": wandb.Image(cf_fig)
             })
             plt.close()
-            self.model.save(os.path.join(self.save_path, wandb.run.id, f"{epoch:3d}"))
             if self.precompute:
                 self.model.vae.to("cpu")
                 torch.cuda.empty_cache()
@@ -402,4 +402,77 @@ class CrossValidationTrainer(TrainerInterface):
     def evaluate(self, ds, sampler, epoch = None):
         for trainer in self.trainers:
             trainer.evaluate(ds, sampler, epoch)
+
+class VAELoss(torch.nn.Module):
+    def __init__(self, threshold: float, kl_weight: float):
+        super().__init__()
+        self.threshold = threshold
+        self.kl_weight = kl_weight
+
+    def forward(self, pred, target):
+        posterior, reconstruction = pred
+        img, mask = torch.split(target, [3, 1], dim = 1)
+        mse = self._masked_mse(reconstruction, img, mask)
+        kl_loss = posterior.kl().mean() * self.kl_weight
+        return mse + kl_loss
+
+    def _masked_mse(self, pred, target, mask):
+        # Get max RGB value per pixel and compare to threshold
+        diff_squared = (pred - target) ** 2
+        masked_diff = diff_squared * mask
+        # epsilon used to prevent divide by 0
+        return masked_diff.sum() / (mask.sum() * pred.shape[1] + 1e-8)
+
+class VAETrainer(TorchTrainer):
+    def __init__(self, num_heatmaps, mask_threshold: float, **kwargs):
+        super().__init__(**kwargs)
+        self.num_heatmaps = num_heatmaps
+        self.mask_threshold = mask_threshold
+        self.hm_data = None
+        self.model.vae.enable_gradient_checkpointing()
+
+    def _get_images_for_heatmap(self, dataset: Dataset):
+        img_list, label_list = [], []
+        for i in range(self.num_heatmaps):
+            img, label = dataset[i]
+            img_list.append(img)
+            label_list.append(label)
+        images = torch.stack(img_list)
+        labels = torch.tensor(label_list)
+        return images, labels
     
+    def _get_mask(self, x: torch.Tensor) -> torch.Tensor:
+        return x.max(dim = -3, keepdim = True)[0] > self.mask_threshold
+    
+    def _load_dataloader(self, ds: Dataset, sampler: Sampler) -> DataLoader:
+        def add_mask(img, _):
+            # data isn't batched yet so concat on dim 0
+            return img, torch.cat((img, self._get_mask(img)))
+        # NOTE can't access labels when using dataloaders
+        ds = MapDataset(ds, add_mask)
+        return super()._load_dataloader(ds, sampler)
+    
+    def train(self, train_ds, val_ds, train_sampler, val_sampler):
+        self.hm_data = self._get_images_for_heatmap(val_ds)
+        super().train(train_ds, val_ds, train_sampler, val_sampler)
+
+    def _calculate_heatmaps(self, images, labels):
+        images = images.to(self.device)
+        new_images = self.model.decode(self.model.encode(images)).cpu()
+        new_images = torch.clamp(new_images, -1, 1)
+        images = images.cpu()
+        mask = self._get_mask(images)
+        heatmaps = torch.mean(torch.abs(new_images - images) * mask, dim = 1, keepdim = True)
+        images = ((images + 1) / 2).permute((0, 2, 3, 1)).numpy()
+        new_images = ((new_images + 1) / 2).permute((0, 2, 3, 1)).numpy()
+        heatmaps = ((heatmaps + 1) / 2).permute((0, 2, 3, 1)).numpy()
+        col_names = ["Original Image", "Reconstructed Image", "Difference Map"]
+        fig = create_counterfactual_grid(images, new_images, heatmaps, labels, col_names)
+        return fig
+
+    def _evaluate(self, dataloader, epoch):
+        metrics = super()._evaluate(dataloader, epoch)
+        fig = self._calculate_heatmaps(*self.hm_data)
+        wandb.log({"difference_heatmaps": fig, "epoch": epoch})
+        plt.close(fig)
+        return metrics

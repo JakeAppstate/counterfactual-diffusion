@@ -52,7 +52,8 @@ def create_grid(images, col_names: List[str] = None, row_names: List[str] = None
     fig.tight_layout()
     return fig
 
-def create_counterfactual_grid(images, cf_images, heatmaps, labels):
+def create_counterfactual_grid(images, cf_images, heatmaps, labels,
+                               col_names = ["Original Image", "Counterfactual Image", "Heatmap"]):
     # TODO May be fun to add another column containing the counterfactual image
     assert len(images) == len(cf_images) == len(heatmaps) == len(labels), \
         "images, heatmaps, and labels should have the same length"
@@ -68,9 +69,9 @@ def create_counterfactual_grid(images, cf_images, heatmaps, labels):
         axes[i][2].imshow(hmap, cmap="plasma")
         axes[i][2].axis('off')
         if i == 0:
-            axes[i][0].set_title("Original Image", fontsize = scale * 5, pad = 10)
-            axes[i][1].set_title("Counterfactual Image", fontsize = scale * 5, pad = 10)
-            axes[i][2].set_title("Heatmap", fontsize = scale * 5, pad = 10)
+            axes[i][0].set_title(col_names[0], fontsize = scale * 5, pad = 10)
+            axes[i][1].set_title(col_names[1], fontsize = scale * 5, pad = 10)
+            axes[i][2].set_title(col_names[2], fontsize = scale * 5, pad = 10)
     fig.tight_layout()
     return fig
 
@@ -142,10 +143,3 @@ def metric_wrapper(y_true: np.array, y_score: np.array, metric_fun,
         #pylint: disable-next:unneccesary-lambda-assignment
         metric_fun = lambda x, y: orig_fun(y, x)
     return metric_fun(y_true, y_score, **kwargs)
-
-def trace_handler(p, output_dir, file_prefix):
-    filename = f"{file_prefix}_step_{p.step_num}.json.gz"
-    path = f"{output_dir}/{filename}"
-    p.export_chrome_trace(path)
-    print(f"Trace saved to {path}")
-    wandb.save(path)

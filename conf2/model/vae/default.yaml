@@ -1,4 +1,46 @@
 model:
-  _target_: diffusers.AutoencoderKL.from_pretrained
-  # Can use hf_id or local folder
-  pretrained_model_or_path: "stabilityai/sd-vae-ft-mse"
+  _target_: src.model.VAE
+  vae:
+    _target_: diffusers.AutoencoderKL.from_pretrained
+    # Can use hf_id or local folder
+    pretrained_model_name_or_path: "stabilityai/sd-vae-ft-mse"
+
+data:
+  rec_split: false
+  # Do not want to split the data recursively, if it does occur, using a value of 100 should throw an error
+  split_index: 100
+  rec_ratio: 0
+  n_sample: [20000, null, null, null]
+  augmentations:
+    _target_: ${const.v2}.Compose
+    transforms:
+      - _target_: ${const.v2}.RandomHorizontalFlip
+        p: 0.5
+
+trainer:
+  _target_: src.train.VAETrainer
+  _convert_: partial
+  model: ${model.model}
+  num_epochs: 100
+  optimizer_fun:
+    _target_: src.utils.get_optimizer
+    optimizer_init:
+      _target_: torch.optim.AdamW
+      _partial_: true
+    weight_decay: 1e-4
+    lr: 5e-6
+  mask_threshold: -0.96078431372 # 5 in uint8 -> [-1, 1]
+  loss:
+    _target_: src.train.VAELoss
+    threshold: ${..mask_threshold}
+    kl_weight: 1e-8
+  batch_size: 8
+  num_workers: 4
+  mixed_precision: "bf16"
+  seed: ${seed}
+  num_save_epochs: 5
+  calculate_metrics: false
+  metrics: {}
+  precompute: false
+  save_path: models/vae
+  num_heatmaps: 8

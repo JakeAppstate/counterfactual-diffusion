@@ -1,5 +1,6 @@
 # pylint: disable=import-error
 from typing import List, Tuple, Union, Optional
+from collections.abc import Callable
 import os
 import re
 import cv2
@@ -103,6 +104,18 @@ class GlaucomaDataset(BaseDataset):
         if self.transform is not None:
             img = self.transform(img)
         return img, label
+    
+class MapDataset(Dataset):
+    def __init__(self, ds: Dataset, fun: Callable):
+        self.ds = ds
+        self.fun = fun
+
+    def __len__(self):
+        return len(self.ds)
+    
+    def __getitem__(self, idx):
+        ret = self.ds[idx]
+        return self.fun(*ret) if isinstance(ret, Tuple) else self.fun(**ret)
 
 class CropROITransform(torch.nn.Module):
     def __init__(self, yolo_path: str, yolo_size: Union[int, Tuple[int, int]],

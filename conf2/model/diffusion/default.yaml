@@ -63,7 +63,7 @@ trainer:
   _target_: src.train.DiffusionTrainer
   _convert_: partial
   model: ${model.model}
-  num_epochs: 200
+  num_epochs: 100
   optimizer_fun:
     _target_: src.utils.get_optimizer
     optimizer_init: 

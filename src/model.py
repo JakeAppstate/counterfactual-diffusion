@@ -1,7 +1,9 @@
 # pylint: disable=E0401; pyright: reportMissingImports=false
+from __future__ import annotations
 from abc import ABC, abstractmethod
 import os
 import pickle
+import json
 from tqdm import tqdm
 from cv2 import medianBlur
 import numpy as np
@@ -17,14 +19,22 @@ class ModelInterface(ABC):
         pass
 
     @abstractmethod
-    def save(self, save_path):
+    def save(self, save_path: str):
         pass
 
-    # TODO add load method
+    @abstractmethod
+    @classmethod
+    def load(cls, save_path: str):
+        pass
 
 class ClassEmbedder(nn.Module, ModelInterface):
     def __init__(self, num_classes: int, emb_dim: int):
         super().__init__()
+        # Used to save state of model to json
+        self.num_classes = num_classes
+        self.emb_dim = emb_dim
+        self.load_path = None
+
         self.null_class_label = num_classes
         self.label_emb = nn.Embedding(num_classes + 1, emb_dim,
                                             padding_idx = self.null_class_label)
@@ -39,29 +49,50 @@ class ClassEmbedder(nn.Module, ModelInterface):
         labels, = args
         x = self.class_emb(self.label_emb(labels))
         return x.unsqueeze(1)
-    
+
     def save(self, save_path):
+        # if model is already saved then create a link to saved model to save storage
+        if self.load_path is not None:
+            os.symlink(self.load_path, save_path)
+            return
+        with open(os.path.join(save_path, "model_args.json"), "w", encoding="utf-8") as file:
+            data = {"num_classes": self.num_classes, "emb_dim": self.emb_dim}
+            json.dump(data, file, indent=4)
         torch.save(self.state_dict(),
-                   os.path.join(save_path, "class_embedder.pt"))
+                   os.path.join(save_path, "model.pt"))
+
+    @classmethod
+    def load(cls, save_path: str) -> ClassEmbedder:
+        # can raise file not found error
+        with open(os.path.join(save_path), "r", encoding="utf-8") as file:
+            args = json.load(file)
+        
+        model = cls(**args)
+        model.load_state_dict(torch.load(os.path.join("model.pt")))
+        model.load_path = save_path
+        return model
+
         
 class VAE(nn.Module, ModelInterface):
     def __init__(self, vae: AutoencoderKL):
         super().__init__()
         self.vae = vae
+        self.load_path = None
         
     def forward(self, *args):
         assert len(args) == 1
         img, = args
-        return self.vae.encode(img).latent_dist.sample() * self.vae.config.scaling_factor
+        posterior = self.vae.encode(img).latent_dist
+        latents = posterior.sample()
+        reconstruction = self.vae.decode(latents).sample
+        return posterior, reconstruction
     
     @torch.no_grad()
     def encode(self, img: torch.Tensor):
-        return self.forward(img)
+        return self.vae.encode(img).latent_dist.mode() * self.vae.config.scaling_factor
     
     @torch.no_grad()
     def decode(self, latents: torch.Tensor):
-        # TODO verify that this doesn't need to occur durring training
-        # If it does then remove no_grad
         latents =  1 / self.vae.config.scaling_factor * latents
         return self.vae.decode(latents).sample
     
@@ -70,7 +101,19 @@ class VAE(nn.Module, ModelInterface):
         return self.vae.device
 
     def save(self, save_path: str):
+        # if model is already saved then create a link to saved model to save storage
+        if self.load_path is not None:
+            os.symlink(self.load_path, save_path)
+            return
         self.vae.save_pretrained(save_path)
+
+    @classmethod
+    def load(cls, save_path: str) -> VAE:
+        # TODO currently wrapper only accepts AutoencoderKL
+        # Would maybe like to be able to use other autoencoders in the future
+        model = cls(AutoencoderKL.from_pretrained(save_path))
+        model.load_path = save_path
+        return model
 
 class LatentDiffusionModel(nn.Module, ModelInterface):
     def __init__(self, vae: VAE, class_embedder: ClassEmbedder,
@@ -84,6 +127,7 @@ class LatentDiffusionModel(nn.Module, ModelInterface):
         self.class_embedder = class_embedder
         self.unet = unet
         self.scheduler = scheduler
+        self.load_path = None
 
     def forward(self, *args):
         assert len(args) == 3
@@ -102,7 +146,7 @@ class LatentDiffusionModel(nn.Module, ModelInterface):
         q = torch.max(q, torch.ones_like(q))
         q = q.unsqueeze(-1).expand(img.shape)
         return torch.clamp(img, -q, q)
-    
+
     # TODO Might should use forward method instead of calling sub models?
     @torch.no_grad()
     def _sample(self, latents, labels, scheduler,
@@ -214,7 +258,10 @@ class LatentDiffusionModel(nn.Module, ModelInterface):
         return images, new_images, heatmap
 
     def save(self, save_path):
-        # probably don't want to save class embedder
+        # if model is already saved then create a link to saved model to save storage
+        if self.load_path is not None:
+            os.symlink(self.load_path, save_path)
+            return
         self.unet.save_pretrained(save_path)
         self.class_embedder.save(save_path)
 
@@ -223,68 +270,82 @@ class LatentDiffusionModel(nn.Module, ModelInterface):
         self.vae.eval()
         return self
 
-class CounterfactualMLClassifier(ModelInterface):
-    def __init__(self, model: sklearn.base.BaseEstimator):
-        self.model = model
+    @classmethod
+    def load(cls, save_path):
+        # load class embedder
+        class_embedder = ClassEmbedder.load(os.path.join(save_path, "class_embedder"))
+        # load unet
+        unet = UNet2DConditionModel.from_pretrained(os.path.join(save_path, "unet"))
+        # load vae
+        vae = VAE.load(os.path.join(save_path, "vae"))
+        # load scheduler
+        scheduler = DDIMScheduler.from_pretrained(os.path.join(save_path, "scheduler"))
+        model = cls(vae, class_embedder, unet, scheduler)
+        model.load_path = save_path
+        return model
 
-    def __call__(self, x):
-        return self.forward(x)
+# class CounterfactualMLClassifier(ModelInterface):
+#     def __init__(self, model: sklearn.base.BaseEstimator):
+#         self.model = model
 
-    def _convert_to_numpy(self, hm):
-        is_torch = isinstance(hm, torch.Tensor)
-        is_numpy = isinstance(hm, np.ndarray)
-        assert is_torch or is_numpy
+#     def __call__(self, x):
+#         return self.forward(x)
 
-        # convert to numpy
-        if is_torch:
-            hm = hm.cpu().numpy()
-        # have 4 dimensions with channel dimension being last
-        # (batch, width, height, channel)
-        if hm.ndim == 3:
-            hm = hm.expand_dims(0)
-        elif hm.ndim == 2:
-            hm = hm.expand_dims((0, -1))
+#     def _convert_to_numpy(self, hm):
+#         is_torch = isinstance(hm, torch.Tensor)
+#         is_numpy = isinstance(hm, np.ndarray)
+#         assert is_torch or is_numpy
 
-        assert hm.ndim == 4 and hm.shape[-1] == 1
-        hm = hm.permute((0, 2, 3, 1))
-        return hm
+#         # convert to numpy
+#         if is_torch:
+#             hm = hm.cpu().numpy()
+#         # have 4 dimensions with channel dimension being last
+#         # (batch, width, height, channel)
+#         if hm.ndim == 3:
+#             hm = hm.expand_dims(0)
+#         elif hm.ndim == 2:
+#             hm = hm.expand_dims((0, -1))
+
+#         assert hm.ndim == 4 and hm.shape[-1] == 1
+#         hm = hm.permute((0, 2, 3, 1))
+#         return hm
     
-    def _extract_features(self, hm):
-        mean = np.mean(hm, axis = (1, 2, 3))
-        maximum = np.max(hm, axis = (1, 2, 3))
-        var = np.var(hm, axis = (1, 2, 3))
+#     def _extract_features(self, hm):
+#         mean = np.mean(hm, axis = (1, 2, 3))
+#         maximum = np.max(hm, axis = (1, 2, 3))
+#         var = np.var(hm, axis = (1, 2, 3))
 
-        # may want to normalize; could be part of pipeline
-        return np.stack([mean, maximum, var], axis = 1)
+#         # may want to normalize; could be part of pipeline
+#         return np.stack([mean, maximum, var], axis = 1)
     
-    def get_features(self, hm):
-        hm = self._convert_to_numpy(hm)
+#     def get_features(self, hm):
+#         hm = self._convert_to_numpy(hm)
 
-        # Apply median filter
-        # convert to uint8
-        x_min, x_max = np.min(hm), hm.max(hm)
-        x_range = x_max - x_min
-        scale = 255.0 / x_range
-        hm = (hm * scale).astype(np.unt8)
-        hm = medianBlur(hm, 5)
+#         # Apply median filter
+#         # convert to uint8
+#         x_min, x_max = np.min(hm), hm.max(hm)
+#         x_range = x_max - x_min
+#         scale = 255.0 / x_range
+#         hm = (hm * scale).astype(np.unt8)
+#         hm = medianBlur(hm, 5)
 
-        return self._extract_features(hm)
+#         return self._extract_features(hm)
     
-    def forward(self, *args):
-        x, = args
-        assert isinstance(x, torch.Tensor) or isinstance(x, np.ndarray)
-        if isinstance(x, torch.Tensor) or x.ndim > 2:
-            # x is a heatmap; need to extract features
-            x = self.get_features(x)
-        return self.model.predict_proba(x)
+#     def forward(self, *args):
+#         x, = args
+#         assert isinstance(x, torch.Tensor) or isinstance(x, np.ndarray)
+#         if isinstance(x, torch.Tensor) or x.ndim > 2:
+#             # x is a heatmap; need to extract features
+#             x = self.get_features(x)
+#         return self.model.predict_proba(x)
     
-    def fit(self, X, y):
-        self.model.fit(X, y)
+#     def fit(self, X, y):
+#         self.model.fit(X, y)
 
-    def save(self, save_path):
-        filepath = os.path.join(save_path, "cf_model.pkl")
-        with open(filepath, "wb") as file:
-            pickle.dump(self.model, file)
+#     def save(self, save_path):
+#         filepath = os.path.join(save_path, "cf_model.pkl")
+#         with open(filepath, "wb") as file:
+#             pickle.dump(self.model, file)
 
 # TODO Pass model as parameter and use hydra to create model
 class CounterfactualTorchClassifier(nn.Module, ModelInterface):
@@ -293,6 +354,7 @@ class CounterfactualTorchClassifier(nn.Module, ModelInterface):
         self.color = torchvision.transforms.v2.Grayscale(num_output_channels=3)
         self.transform = torchvision.models.MobileNet_V2_Weights.IMAGENET1K_V2.transforms()
         self.model = torchvision.models.mobilenet_v2(weights="DEFAULT")
+        self.load_path = None
 
         for param in self.model.parameters():
             param.requires_grad = False
@@ -309,3 +371,10 @@ class CounterfactualTorchClassifier(nn.Module, ModelInterface):
     def save(self, save_path):
         torch.save(self.state_dict(),
                    os.path.join(save_path, "cf_classifier.pt"))
+
+    @classmethod
+    def load(cls, save_path):
+        model = cls()
+        model.load_path = save_path
+        model.load_state_dict(torch.load(os.path.join(save_path, "cf_classifier.pt")))
+        return model
