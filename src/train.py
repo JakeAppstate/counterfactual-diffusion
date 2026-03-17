@@ -1,12 +1,13 @@
 #pylint: disable=E0401
 from enum import Enum
 from typing import List, Dict, Tuple, Union, Iterator
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from abc import ABC, abstractmethod
 import os
 from cv2 import medianBlur
 import numpy as np
 import matplotlib.pyplot as plt
+import lpips
 import sklearn
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, roc_auc_score, \
                             f1_score, precision_score, recall_score
@@ -18,7 +19,7 @@ from tqdm import tqdm
 
 import src.model
 from src.utils import create_grid, create_counterfactual_grid
-from src.data import MapDataset
+from src.data import MapDataset, ZippedDataset
 
 # Custom Types
 Metrics = Dict[str, Callable[[float, float], float]]
@@ -65,8 +66,10 @@ class TorchTrainer(TrainerInterface):
         self.device_str = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(self.device_str)
 
-        # Get optimizer
-        self.optimizer = optimizer_fun(self.model.parameters())
+        # Get optimizer in train function
+        self.optimizer_fun = optimizer_fun
+        self.optimizer = None
+        # self.optimizer = optimizer_fun(self.model.parameters())
 
         if mixed_precision == "bf16" and torch.cuda.is_bf16_supported():
             self.dtype = torch.bfloat16
@@ -81,22 +84,25 @@ class TorchTrainer(TrainerInterface):
     # pylint:disable-next=unused-argument
     def _precompute(self, dataloader: DataLoader) -> Dataset:
         return None
-
-    def _load_dataloader(self, ds: Dataset, sampler: Sampler) -> DataLoader:
-        data = DataLoader(ds, batch_size = self.batch_size, shuffle = False,
+    
+    def _get_dataloader(self, ds: Dataset, sampler: Sampler):
+        return DataLoader(ds, batch_size = self.batch_size, shuffle = False,
                            num_workers = self.num_workers, pin_memory = True,
                            sampler = sampler)
+
+    def _load_dataloader(self, ds: Dataset, sampler: Sampler) -> DataLoader:
+        data = self._get_dataloader(ds, sampler)
         if self.precompute:
             # _precompute might not be implemented and return None
             ds = self._precompute(data) or ds
-            data = DataLoader(ds, batch_size = self.batch_size, shuffle = False,
-                           num_workers = self.num_workers, pin_memory = True,
-                           sampler = sampler)
+            data = self._get_dataloader(ds, sampler)
         return data
     
     def train(self, train_ds: Dataset, val_ds: Dataset, train_sampler: Sampler, val_sampler: Sampler):
         self.model.train()
         self.model.to(self.device)
+        self.loss.train()
+        self.optimizer = self.optimizer_fun(self.model.parameters())
         train = self._load_dataloader(train_ds, train_sampler)
         val = self._load_dataloader(val_ds, val_sampler)
         global_step = 0
@@ -104,10 +110,12 @@ class TorchTrainer(TrainerInterface):
             pred_list = []
             target_list = []
             print("Starting epoch:", epoch)
-            for images, labels in tqdm(train):
-                images = images.to(self.device, non_blocking = True)
-                labels = labels.to(self.device, non_blocking = True)
-                loss, pred, target = self._train_step((images,), labels)
+            for x, y in tqdm(train):
+                # torch tensors are not considered sequences
+                x = (x,) if not isinstance(x, Sequence) else x
+                x = tuple(t.to(self.device, non_blocking = True) for t in x)
+                y = y.to(self.device, non_blocking = True)
+                loss, pred, target = self._train_step(x, y)
                 wandb.log({
                     "epoch": epoch,
                     "global_step": global_step,
@@ -133,7 +141,7 @@ class TorchTrainer(TrainerInterface):
                 self.model.save(save_path)
 
     def _train_step(self, x: Tuple[torch.Tensor, ...], y: torch.Tensor, training: bool = True) -> TrainStepReturn:
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none = True)
         with torch.amp.autocast(self.device_str, dtype = self.dtype,
                                 enabled = (self.mixed_precision in ["bf16", "fp16"])):
             pred = self.model(*x)
@@ -154,14 +162,16 @@ class TorchTrainer(TrainerInterface):
     def _evaluate(self, dataloader: DataLoader, epoch: int):
         train_mode = self.model.training
         self.model.eval()
+        self.loss.eval()
         pred_list = []
         target_list = []
         loss_acc = 0.0
         i = 0
-        for images, labels in tqdm(dataloader):
-            images = images.to(self.device, non_blocking = True)
-            labels = labels.to(self.device, non_blocking = True)
-            loss, pred, target = self._train_step((images,), labels, training = False)
+        for x, y in tqdm(dataloader):
+            x = (x,) if not isinstance(x, Sequence) else x
+            x = tuple(t.to(self.device, non_blocking = True) for t in x)
+            y = y.to(self.device)
+            loss, pred, target = self._train_step(x, y, training = False)
             if self.calculate_metrics:
                 pred_list.append(pred)
                 target_list.append(target)
@@ -180,6 +190,8 @@ class TorchTrainer(TrainerInterface):
         wandb.log(metrics)
         #pylint:disable-next=expression-not-assigned
         self.model.train() if train_mode else self.model.eval()
+        #pylint:disable-next=expression-not-assigned
+        self.loss.train() if train_mode else self.loss.eval()
         return metrics
     
     @torch.no_grad()
@@ -198,11 +210,6 @@ class DiffusionTrainer(TorchTrainer):
     def __init__(self, p_label_dropout: float, num_inference_steps: int,
                  ema_decay: float, num_generate: int, num_counterfactual: int,
                  guidance_scale: float, use_dn: bool, percent_steps: float, **kwargs):
-        # Dont initalizer optimizer just yet
-        # Want to pass parameter groups and remove VAE
-        optimizer_fun = kwargs.pop("optimizer_fun")
-        # pass dummy function that returns None
-        kwargs["optimizer_fun"] = lambda *args: None
         # Metrics are not supported as storing predictions would use too much memory
         # Also, there are not any metrics that use only one diffusion step
         assert not kwargs["metrics"], "No metrics should be used for training diffusion model as \
@@ -230,7 +237,7 @@ class DiffusionTrainer(TorchTrainer):
             (ParameterGroupNames.CLASS_EMBEDDER.value, self.model.class_embedder.parameters()),
             (ParameterGroupNames.UNET.value, self.model.unet.parameters())
         ]
-        self.optimizer = optimizer_fun(params=params)
+        self.optimizer_fun= lambda *args : self.optimizer_fun(params=params)
 
     @torch.no_grad()
     def _precompute(self, dataloader: DataLoader) -> Dataset:
@@ -368,9 +375,9 @@ class CounterfactualTorchTrainer(TorchTrainer):
         torch.cuda.empty_cache()
         return new_dataset
     
-    def _train_step(self, images, labels, training = True):
-        labels = labels.float()
-        return super()._train_step(images, labels, training)
+    def _train_step(self, x, y, training = True):
+        y = y.float()
+        return super()._train_step(x, y, training)
 
     
 class CrossValidationTrainer(TrainerInterface):
@@ -403,25 +410,135 @@ class CrossValidationTrainer(TrainerInterface):
         for trainer in self.trainers:
             trainer.evaluate(ds, sampler, epoch)
 
-class VAELoss(torch.nn.Module):
-    def __init__(self, threshold: float, kl_weight: float):
+class HyperParameterTuningTrainer(TrainerInterface):
+    def __init__(self, seed: int, n_folds: int, trainer_init: Callable[[dict], TrainerInterface],
+                 trainer_kwargs: dict, hyperparams: dict[str, Tuple[float, float, float]]):
+        pass
+    
+    def train(self, train_ds, val_ds, train_sampler, val_sampler):
+        pass
+
+    def evaluate(self, ds, sampler, epoch = None):
+        pass
+
+class NewVAELoss(torch.nn.Module):
+    def __init__(self, lpips_weight: float):
         super().__init__()
-        self.threshold = threshold
-        self.kl_weight = kl_weight
+        self.lpips_weight = lpips_weight
+        # TODO might want to use trainer device instead of hardcoding cuda
+        lpips_loss = lpips.LPIPS(net="alex").to("cuda").eval()
+        for param in lpips_loss.parameters():
+            param.requires_grad = False
+        self.lpips_loss = lpips_loss
 
     def forward(self, pred, target):
-        posterior, reconstruction = pred
-        img, mask = torch.split(target, [3, 1], dim = 1)
-        mse = self._masked_mse(reconstruction, img, mask)
-        kl_loss = posterior.kl().mean() * self.kl_weight
-        return mse + kl_loss
+        mae_loss = torch.nn.functional.l1_loss(pred, target)
+        lpips_loss = self.lpips_loss(pred, target).mean()
+        val_key = "val_" if not self.training else ""
+        wandb.log({
+            f"{val_key}l1_loss": mae_loss,
+            f"{val_key}lpips_loss": lpips_loss
+        }, commit = False)
+        return mae_loss + self.lpips_weight * lpips_loss
 
-    def _masked_mse(self, pred, target, mask):
-        # Get max RGB value per pixel and compare to threshold
-        diff_squared = (pred - target) ** 2
-        masked_diff = diff_squared * mask
-        # epsilon used to prevent divide by 0
-        return masked_diff.sum() / (mask.sum() * pred.shape[1] + 1e-8)
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.lpips_loss.eval()
+        return self
+        
+class NewVAETrainer(TorchTrainer):
+    def __init__(self, num_heatmaps, **kwargs):
+        super().__init__(**kwargs)
+        # TODO may need to modify trainable parameters
+        self.num_heatmaps = num_heatmaps
+        self.hm_data = None
+        # Freeze encoder weights
+        for param in self.model.vae.encoder.parameters():
+            param.requires_grad = False
+
+    def _load_dataloader(self, ds, sampler):
+        data = self._get_dataloader(ds, sampler)
+        # Don't want img to be converted into TensorDataset as they are too large to fit into memory
+        # Keep latents in memory and load images on the fly
+        # Label isn't used for training the VAE
+        def join_fn(img, label, mean, logvar):
+            return (mean, logvar), img
+            
+        if self.precompute:
+            new_ds = self._precompute(data)
+            zipped_ds = ZippedDataset(ds, new_ds)
+            ds = MapDataset(zipped_ds, join_fn)
+        else:
+            # Want img to be label
+            # Do this after creating the original dataloader to save memory when precomputing
+            ds = MapDataset(ds, lambda x, y : (x, x))
+        data = self._get_dataloader(ds, sampler)
+        return data
+    
+    def _precompute(self, dataloader) -> Dataset:
+        self.model.vae.encoder.to(self.device)
+        self.model.vae.decoder.to("cpu")
+        torch.cuda.empty_cache()
+        mean_list, logvar_list = [], []
+        print("Precomputing latents")
+        for img, _ in tqdm(dataloader):
+            img = img.to(self.device)
+            mean, logvar = self.model.get_latent_dist(img)
+            mean_list.append(mean.cpu())
+            logvar_list.append(logvar.cpu())
+        mean_tensor = torch.cat(mean_list)
+        logvar_tensor = torch.cat(logvar_list)
+        new_dataset = TensorDataset(mean_tensor, logvar_tensor)
+        self.model.vae.encoder.to("cpu")
+        self.model.vae.decoder.to(self.device)
+        torch.cuda.empty_cache()
+        return new_dataset
+    
+    def _get_images_for_heatmap(self, dataset: Dataset):
+        img_list, label_list = [], []
+        for i in range(self.num_heatmaps):
+            img, label = dataset[i]
+            img_list.append(img)
+            label_list.append(label)
+        images = torch.stack(img_list)
+        labels = torch.tensor(label_list)
+        return images, labels
+
+    def train(self, train_ds, val_ds, train_sampler, val_sampler):
+        self.hm_data = self._get_images_for_heatmap(val_ds)
+        return super().train(train_ds, val_ds, train_sampler, val_sampler)
+    
+    def _train_step(self, x, y, training = True):
+        if not self.precompute:
+            # Currently, get_latent_dist uses .encode which does not use gradients
+            # x is a tuple of length 1
+            x = self.model.get_latent_dist(x[0])
+        return super()._train_step(x, y, training)
+
+    def _calculate_heatmaps(self, images, labels):
+        images = images.to(self.device)
+        new_images = self.model.decode(self.model.encode(images)).cpu()
+        new_images = torch.clamp(new_images, -1, 1)
+        images = images.cpu()
+        heatmaps = torch.mean(torch.abs(new_images - images), dim = 1, keepdim = True)
+        images = ((images + 1) / 2).permute((0, 2, 3, 1)).numpy()
+        new_images = ((new_images + 1) / 2).permute((0, 2, 3, 1)).numpy()
+        heatmaps = ((heatmaps + 1) / 2).permute((0, 2, 3, 1)).numpy()
+        col_names = ["Original Image", "Reconstructed Image", "Difference Map"]
+        fig = create_counterfactual_grid(images, new_images, heatmaps, labels, col_names)
+        return fig
+    
+    def _evaluate(self, dataloader, epoch):
+        metrics = super()._evaluate(dataloader, epoch)
+        # move encoder to GPU if it isn't on it
+        encoder_device = next(self.model.vae.encoder.parameters()).device
+        self.model.vae.encoder.to(self.device)
+        fig = self._calculate_heatmaps(*self.hm_data)
+        wandb.log({"difference_heatmaps": fig, "epoch": epoch})
+        plt.close(fig)
+        # Move encoder back to its origional device
+        self.model.vae.encoder.to(encoder_device)
+        return metrics
 
 class VAETrainer(TorchTrainer):
     def __init__(self, num_heatmaps, mask_threshold: float, **kwargs):

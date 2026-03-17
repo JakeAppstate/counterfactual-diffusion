@@ -22,8 +22,8 @@ class ModelInterface(ABC):
     def save(self, save_path: str):
         pass
 
-    @abstractmethod
     @classmethod
+    @abstractmethod
     def load(cls, save_path: str):
         pass
 
@@ -78,24 +78,53 @@ class VAE(nn.Module, ModelInterface):
         super().__init__()
         self.vae = vae
         self.load_path = None
-        
+    
+    # TODO modify if needed
+    # def forward(self, *args):
+    #     assert len(args) == 1
+    #     img, = args
+    #     posterior = self.vae.encode(img).latent_dist
+    #     latents = posterior.sample()
+    #     reconstruction = self.vae.decode(latents).sample
+    #     return posterior, reconstruction
+
     def forward(self, *args):
-        assert len(args) == 1
-        img, = args
+        assert len(args) == 2
+        mean, logvar = args
+        latents = self.sample_from_dist(mean, logvar)
+        return self.decode_grad(latents)
+    
+    def sample_from_dist(self, mean, logvar):
+        assert mean.shape == logvar.shape
+        # N(mu, sigma) ~ mu + N(0, 1) * sigma
+        # sigma = \sqrt(var) = \sqrt(exp(log(var))) = exp(0.5 * log(var))
+        noise = torch.randn(*mean.shape).to(mean.device)
+        latents = mean + noise * torch.exp(0.5 * logvar)
+        return latents * self.vae.config.scaling_factor
+
+    @torch.no_grad()
+    def get_latent_dist(self, img):
+        # Should this use gradients?
         posterior = self.vae.encode(img).latent_dist
-        latents = posterior.sample()
-        reconstruction = self.vae.decode(latents).sample
-        return posterior, reconstruction
-    
+        return posterior.mean, posterior.logvar
+
+    def encode_grad(self, img: torch.Tensor, sample: bool = True):
+        posterior = self.vae.encode(img).latent_dist
+        latents = posterior.sample() if sample else posterior.mode()
+        return latents * self.vae.config.scaling_factor
+
     @torch.no_grad()
-    def encode(self, img: torch.Tensor):
-        return self.vae.encode(img).latent_dist.mode() * self.vae.config.scaling_factor
-    
-    @torch.no_grad()
-    def decode(self, latents: torch.Tensor):
+    def encode(self, img: torch.Tensor, sample: bool = True):
+        return self.encode_grad(img, sample)
+
+    def decode_grad(self, latents: torch.Tensor):
         latents =  1 / self.vae.config.scaling_factor * latents
         return self.vae.decode(latents).sample
-    
+
+    @torch.no_grad()
+    def decode(self, latents: torch.Tensor):
+        return self.decode_grad(latents)
+
     @property
     def device(self):
         return self.vae.device
@@ -227,7 +256,7 @@ class LatentDiffusionModel(nn.Module, ModelInterface):
         idx = int(np.ceil(percent_steps * num_inference_steps))
 
         images = images.to(self.vae.device)
-        latents = self.vae.encode(images)
+        latents = self.vae.encode(images, sample = False)
         images = images.cpu() # remove images from gpu to save vram
         latents = latents.to(device, dtype = self.unet.dtype)
         # latents = latents.to(self.unet.dtype)
@@ -247,7 +276,10 @@ class LatentDiffusionModel(nn.Module, ModelInterface):
                                guidance_scale=guidance_scale, use_dn=use_dn, start_idx=-idx, log = log)
         # Decode latents to images
         new_images = self.vae.decode(latents).float().cpu()
-        heatmap = torch.mean(torch.abs(new_images - images), dim=1, keepdim=True)
+        # Only subtract the non black parts of the image
+        mask_threshold = (5 / 255) * 2 - 1 # pixel value of 5 or less mapped to [-1, 1]
+        mask = images.max(dim = -3, keepdim = True)[0] > mask_threshold
+        heatmap = torch.mean(torch.abs(new_images - images) * mask, dim=1, keepdim=True)
         # new_images = torch.clamp((new_images + 1) / 2, 0, 1).cpu() # scale to [0, 1]
         # convert to output format
         heatmap = heatmap.to(torch.float32)

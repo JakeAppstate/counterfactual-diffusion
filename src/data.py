@@ -104,7 +104,7 @@ class GlaucomaDataset(BaseDataset):
         if self.transform is not None:
             img = self.transform(img)
         return img, label
-    
+
 class MapDataset(Dataset):
     def __init__(self, ds: Dataset, fun: Callable):
         self.ds = ds
@@ -116,6 +116,26 @@ class MapDataset(Dataset):
     def __getitem__(self, idx):
         ret = self.ds[idx]
         return self.fun(*ret) if isinstance(ret, Tuple) else self.fun(**ret)
+
+class ZippedDataset(Dataset):
+    def __init__(self, ds1: Dataset, ds2: Dataset):
+        assert len(ds1) == len(ds2), "Can't zip datasets - are different lengths"
+        self.ds1 = ds1
+        self.ds2 = ds2
+
+    def __len__(self):
+        return len(self.ds1)
+
+    def __getitem__(self, idx):
+        ret1 = self.ds1[idx]
+        ret2 = self.ds2[idx]
+        if isinstance(ret1, dict) and isinstance(ret2, dict):
+            return ret1 + ret2
+        if isinstance(ret1, dict):
+            return (*ret1.values(), *ret2)
+        if isinstance(ret2, dict):
+            return (*ret1, *ret2.values())
+        return (*ret1, *ret2)
 
 class CropROITransform(torch.nn.Module):
     def __init__(self, yolo_path: str, yolo_size: Union[int, Tuple[int, int]],
@@ -171,6 +191,7 @@ class CropROITransform(torch.nn.Module):
         return self
 
 # typedef
+DataframeTuple = Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame]]
 DatasetTuple = Tuple[GlaucomaDataset, GlaucomaDataset, GlaucomaDataset, Optional[GlaucomaDataset]]
 
 # TODO can probably refactor some of the code to be cleaner
@@ -188,6 +209,7 @@ class DataModule:
                  n_sample: Union[int, Tuple[int, int, int, int]] = None,
                  rec_split: bool = False,
                  split_index: int = 1,
+                 new_index: int = 0,
                  train_transform: torch.nn.Module = None,
                  val_transform: torch.nn.Module = None):
         self.csv_path = csv_path
@@ -203,23 +225,26 @@ class DataModule:
         self.n_sample = (n_sample,) * 4 if isinstance(n_sample, int) else n_sample
         self.rec_split = rec_split
         self.split_index = split_index
+        self.new_index = new_index
         self.train_transform = train_transform
         self.val_transform = val_transform
 
     def load_datasets(self) -> DatasetTuple:
-        # Load in cdv and split
+        # Load in csv and split
         df = pd.read_csv(self.csv_path, sep=';')
-        dataframes = self._split_dataframes(df, self.val_ratio, self.test_ratio, self.include_real)
+        dataframes = list(self._split_dataframes(df, self.val_ratio, self.test_ratio, self.include_real))
+        # Code for blending
+        # Recursively split dataset and use one of the newly split datasets in place of original
+        if self.rec_split:
+            df = dataframes[self.split_index]
+            new_df = self._split_dataframes(df, self.rec_ratio, 0, False)[self.new_index]
+            dataframes[self.split_index] = new_df
+
         # Get subset of datasets id needed
         if self.n_sample is not None:
             dataframes = [self._get_subset(df, n) for df, n in zip(dataframes, self.n_sample)]
+
         train_df, val_df, test_df, real_df = dataframes
-        # Recursively split dataset if needed
-        # Heatmap classifier only trains on validation data
-        # Need train subset and validation subset
-        if self.rec_split:
-            df = dataframes[self.split_index]
-            train_df, val_df, _, _ = self._split_dataframes(df, self.rec_ratio, 0, False)
 
         # Get precomputed bounding boxes if available
         # If they aren't, then compute them before training
@@ -243,14 +268,18 @@ class DataModule:
 
         return train, val, test, real
 
-    def _split_dataframes(self, df: pd.DataFrame, val_ratio: float, test_ratio: float, include_real: bool) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame]]:
+    # TODO Add option for nonbalanced val set
+    def _split_dataframes(self, df: pd.DataFrame, val_ratio: float, test_ratio: float,
+                          include_real: bool, balance_val: bool = True) -> DataframeTuple:
         pos_df = df[df['Final Label'] == "RG"]
         neg_df = df[df['Final Label'] != "RG"]
+        # Shuffle
         pos_df = pos_df.sample(frac=1, random_state=self.seed)
         neg_df = neg_df.sample(frac=1, random_state=self.seed)
 
         n_pos, n_neg = len(pos_df), len(neg_df)
         n_pos_val = int(len(pos_df) * val_ratio)
+        n_neg_val = int(n_pos_val / n_pos * n_neg) if not balance_val else n_pos_val
         n_pos_test = int(len(pos_df) * test_ratio)
         n_neg_real = int(n_pos_test / n_pos * n_neg)
         if not include_real:
@@ -260,10 +289,10 @@ class DataModule:
         pos_test = pos_df.iloc[:n_pos_test]
         pos_val = pos_df.iloc[n_pos_test : n_pos_test + n_pos_val]
         pos_train = pos_df.iloc[n_pos_test + n_pos_val:]
-        neg_val = neg_df.iloc[:n_pos_val]
-        neg_test = neg_df.iloc[n_pos_val : n_pos_val + n_pos_test]
-        neg_real = neg_df.iloc[n_pos_val : n_pos_val + n_neg_real]
-        neg_train = neg_df.iloc[n_pos_val + n_neg_real : ]
+        neg_val = neg_df.iloc[:n_neg_val]
+        neg_test = neg_df.iloc[n_neg_val : n_neg_val + n_pos_test]
+        neg_real = neg_df.iloc[n_neg_val : n_neg_val + n_neg_real]
+        neg_train = neg_df.iloc[n_neg_val + n_neg_real : ]
 
         train = pd.concat([pos_train, neg_train]).sample(frac=1, random_state=self.seed)
         val = pd.concat([pos_val, neg_val]).sample(frac=1, random_state=self.seed)
