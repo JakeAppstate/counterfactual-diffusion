@@ -1,7 +1,8 @@
 #pylint: disable=E0401
 from enum import Enum
-from typing import List, Dict, Tuple, Union, Iterator
+from typing import List, Dict, Tuple, Union, Iterator, Optional
 from collections.abc import Callable, Sequence
+from functools import partial
 from abc import ABC, abstractmethod
 import os
 from cv2 import medianBlur
@@ -13,7 +14,7 @@ from sklearn.metrics import accuracy_score, balanced_accuracy_score, roc_auc_sco
                             f1_score, precision_score, recall_score
 from diffusers import DDPMScheduler, DDIMScheduler, EMAModel
 import wandb
-from torch.utils.data import Dataset, TensorDataset, DataLoader, Sampler, Subset
+from torch.utils.data import Dataset, TensorDataset, DataLoader, Sampler, SequentialSampler, Subset
 import torch
 from tqdm import tqdm
 
@@ -47,8 +48,9 @@ class TrainerInterface(ABC):
 class TorchTrainer(TrainerInterface):
     def __init__(self, model: TorchModel, num_epochs: int, optimizer_fun: OptimizerFun,
                  loss: torch.nn.Module, batch_size: int, num_workers: int, mixed_precision: str,
-                 precompute: bool, metrics: Metrics,
-                 calculate_metrics: bool, seed: int, num_save_epochs: int, save_path: str):
+                 precompute: bool, metrics: Metrics, steps_per_log: int,
+                 wandb_init_fun: Callable[[], Optional[wandb.Run]], calculate_metrics: bool,
+                 seed: int, num_save_epochs: int, save_path: str):
         self.model = model
         self.num_epochs = num_epochs
         self.loss = loss
@@ -57,6 +59,8 @@ class TorchTrainer(TrainerInterface):
         self.mixed_precision = mixed_precision
         self.precompute = precompute
         self.metrics = metrics
+        self.steps_per_log = steps_per_log
+        self.wandb_init_fun = wandb_init_fun
         self.calculate_metrics = calculate_metrics
         self.seed = seed
         self.num_save_epochs = num_save_epochs
@@ -81,6 +85,8 @@ class TorchTrainer(TrainerInterface):
             self.dtype = torch.float32
             self.scaler = None
 
+        self.global_step = 0
+
     # pylint:disable-next=unused-argument
     def _precompute(self, dataloader: DataLoader) -> Dataset:
         return None
@@ -91,50 +97,81 @@ class TorchTrainer(TrainerInterface):
                            sampler = sampler)
 
     def _load_dataloader(self, ds: Dataset, sampler: Sampler) -> DataLoader:
-        data = self._get_dataloader(ds, sampler)
         if self.precompute:
+            identity_sampler = SequentialSampler(ds)
+            data = self._get_dataloader(ds, identity_sampler)
             # _precompute might not be implemented and return None
             ds = self._precompute(data) or ds
-            data = self._get_dataloader(ds, sampler)
+        data = self._get_dataloader(ds, sampler)
         return data
     
-    def train(self, train_ds: Dataset, val_ds: Dataset, train_sampler: Sampler, val_sampler: Sampler):
+    def _train_setup(self, train_ds: Dataset, val_ds: Dataset, train_sampler: Sampler,
+                     val_sampler: Sampler) -> Tuple[DataLoader, DataLoader]:
         self.model.train()
         self.model.to(self.device)
         self.loss.train()
         self.optimizer = self.optimizer_fun(self.model.parameters())
         train = self._load_dataloader(train_ds, train_sampler)
         val = self._load_dataloader(val_ds, val_sampler)
-        global_step = 0
-        for epoch in range(1, self.num_epochs + 1):
-            pred_list = []
-            target_list = []
-            print("Starting epoch:", epoch)
-            for x, y in tqdm(train):
-                # torch tensors are not considered sequences
-                x = (x,) if not isinstance(x, Sequence) else x
-                x = tuple(t.to(self.device, non_blocking = True) for t in x)
-                y = y.to(self.device, non_blocking = True)
-                loss, pred, target = self._train_step(x, y)
+        self.global_step = 0
+        return train, val
+
+    def train_one_epoch(self, train: DataLoader, val: DataLoader, epoch: int = 1):
+        pred_list = []
+        target_list = []
+        print("Starting epoch:", epoch)
+        running_loss = 0.0
+        total_loss = 0.0
+        running_samples = 0
+        total_samples = 0
+        for step, (x, y) in enumerate(tqdm(train)):
+            # torch tensors are not considered sequences
+            x = (x,) if not isinstance(x, Sequence) else x
+            x = tuple(t.to(self.device, non_blocking = True) for t in x)
+            y = y.to(self.device, non_blocking = True)
+            n = len(y)
+            loss, pred, target = self._train_step(x, y)
+            running_loss += loss * n
+            total_loss += loss * n
+            running_samples += n
+            total_samples += n
+            self.global_step += 1
+            # Reduces the number of network requests
+            if self.steps_per_log != 0 and step % self.steps_per_log == 0:
+                avg_step_loss = running_loss / running_samples
                 wandb.log({
                     "epoch": epoch,
-                    "global_step": global_step,
-                    "loss": loss
+                    "global_step": self.global_step,
+                    "loss": avg_step_loss
                 })
-                # For diffusion models prediction and targets are full sized images
-                # Storing them would use too much memory (N * 512 * 512 * 3 * 4 bytes)
-                if self.calculate_metrics:
-                    pred_list.append(pred)
-                    target_list.append(target)
-                global_step += 1
+                running_loss = 0.0
+                running_samples = 0
+            # For diffusion models prediction and targets are full sized images
+            # Storing them would use too much memory (N * 512 * 512 * 3 * 4 bytes)
             if self.calculate_metrics:
-                pred = torch.cat(pred_list).numpy()
-                target = torch.cat(target_list).numpy()
-                metrics = self._calculate_metrics(pred, target)
-                metrics["epoch"] = epoch
-                wandb.log(metrics)
-            print("Performing validation")
-            self._evaluate(val, epoch)
+                pred_list.append(pred)
+                target_list.append(target)
+        metrics = {}
+        avg_loss = total_loss / total_samples
+        metrics["avg_loss"] = avg_loss
+        metrics["loss"] = running_loss / running_samples
+        if self.calculate_metrics:
+            pred = torch.cat(pred_list).numpy()
+            target = torch.cat(target_list).numpy()
+            metrics = self._calculate_metrics(pred, target)
+            metrics["epoch"] = epoch
+            # wandb.log(metrics)
+        print("Performing validation")
+        metrics = metrics | self._evaluate(val, epoch)
+        return metrics
+
+    def train(self, train_ds: Dataset, val_ds: Dataset,
+              train_sampler: Sampler, val_sampler: Sampler):
+        train, val = self._train_setup(train_ds, val_ds, train_sampler, val_sampler)
+        self.wandb_init_fun()
+        for epoch in range(1, self.num_epochs + 1):
+            metrics = self.train_one_epoch(train, val, epoch)
+            wandb.log(metrics)
             if epoch % self.num_save_epochs == 0:
                 save_path = os.path.join(self.save_path, wandb.run.id, str(epoch))
                 os.makedirs(save_path, exist_ok=True)
@@ -166,18 +203,19 @@ class TorchTrainer(TrainerInterface):
         pred_list = []
         target_list = []
         loss_acc = 0.0
-        i = 0
+        num_samples = 0
         for x, y in tqdm(dataloader):
             x = (x,) if not isinstance(x, Sequence) else x
             x = tuple(t.to(self.device, non_blocking = True) for t in x)
             y = y.to(self.device)
+            n = len(y)
             loss, pred, target = self._train_step(x, y, training = False)
             if self.calculate_metrics:
                 pred_list.append(pred)
                 target_list.append(target)
-            loss_acc += loss
-            i += 1
-        loss = loss_acc / i
+            loss_acc += loss * n
+            num_samples += n
+        loss = loss_acc / num_samples
         metrics = {}
         if self.calculate_metrics:
             preds = torch.cat(pred_list).numpy()
@@ -187,7 +225,7 @@ class TorchTrainer(TrainerInterface):
         metrics["val_loss"] = loss
         if epoch is not None:
             metrics["epoch"] = epoch
-        wandb.log(metrics)
+        # wandb.log(metrics)
         #pylint:disable-next=expression-not-assigned
         self.model.train() if train_mode else self.model.eval()
         #pylint:disable-next=expression-not-assigned
@@ -197,7 +235,9 @@ class TorchTrainer(TrainerInterface):
     @torch.no_grad()
     def evaluate(self, ds: Dataset, sampler: Sampler):
         data = self._load_dataloader(ds, sampler)
-        return self._evaluate(data, None)
+        metrics = self._evaluate(data, None)
+        wandb.log(metrics)
+        return metrics
         
     def _calculate_metrics(self, pred: np.array, target: np.array):
         metrics = {}
@@ -264,9 +304,9 @@ class DiffusionTrainer(TorchTrainer):
         torch.cuda.empty_cache()
         return new_dataset
     
-    def train(self, train_ds, val_ds, train_sampler, val_sampler):
+    def _train_setup(self, train_ds, val_ds, train_sampler, val_sampler):
         self.cf_data = self._get_counterfactual_dataset(val_ds)
-        super().train(train_ds, val_ds, train_sampler, val_sampler)
+        super()._train_setup(train_ds, val_ds, train_sampler, val_sampler)
 
     def _train_step(self, x, y, training = True):
         # Device locations should be okay for training
@@ -340,7 +380,6 @@ class DiffusionTrainer(TorchTrainer):
             if self.precompute:
                 self.model.vae.to("cpu")
                 torch.cuda.empty_cache()
-        
 
 class CounterfactualTorchTrainer(TorchTrainer):
     def __init__(self, diffusion_model: src.model.LatentDiffusionModel, inference_hyperparams: dict, **kwargs):
@@ -381,13 +420,22 @@ class CounterfactualTorchTrainer(TorchTrainer):
 
     
 class CrossValidationTrainer(TrainerInterface):
-    def __init__(self,  trainers: List[TrainerInterface],
-                 n_folds: int, seed: int):
-        self.trainers = trainers
+    def __init__(self,  create_trainer_fun: Callable[[], TorchTrainer],
+                 n_folds: int, seed: int, num_epochs: int,
+                 wandb_init_fun: Callable[[], Optional[wandb.Run]]):
+        # Dont have sub trainer call wandb.init
+        create_trainer_fun = partial(create_trainer_fun, wandb_init_fun = lambda: None)
+        self.create_trainer_fun = create_trainer_fun
         self.n_folds = n_folds
         self.seed = seed
+        self.num_epochs = num_epochs
+        self.wandb_init_fun = wandb_init_fun
+        self.non_metric_keys = ["epoch", "global_step"]
 
     def _get_folds(self, ds):
+        trainer = self.create_trainer_fun()
+        ds = self._precompute(ds, trainer)
+        # Calculate fold indicies and get subsets
         folds = []
         y = ds.get_targets()
         X = np.zeros_like(y)
@@ -397,29 +445,83 @@ class CrossValidationTrainer(TrainerInterface):
             train = Subset(ds, train_idx)
             val = Subset(ds, val_idx)
             folds.append((train, val))
+        del trainer
         return folds
-    
-    def train(self, train_ds, val_ds, train_sampler, val_sampler):
-        folds = self._get_folds(train_ds)
-        for trainer in self.trainers:
-            for i, (train, val) in enumerate(folds):
-                trainer.save_path = os.path.join(trainer.save_path, f"fold{i}")
-                trainer.train(train, val, train_sampler, val_sampler)
 
-    def evaluate(self, ds, sampler, epoch = None):
-        for trainer in self.trainers:
-            trainer.evaluate(ds, sampler, epoch)
+    def _precompute(self, ds: Dataset, trainer: TorchTrainer):
+        sampler = SequentialSampler(ds)
+        precompute_val = trainer.precompute
+        trainer.precompute = False
+        # pylint: disable-next=protected-access
+        dataloader = trainer._get_dataloader(ds, sampler)
+        # pylint: disable-next=protected-access
+        new_ds = trainer._precompute(dataloader) if precompute_val else ds
+        trainer.precompute = precompute_val
+        return new_ds
+
+    def _modify_metrics(self, metrics: dict, new_metrics: dict) -> dict:
+        if metrics is None:
+            return new_metrics
+        for k in metrics:
+            if k in self.non_metric_keys:
+                continue
+            metrics[k] += new_metrics[k]
+        return metrics
+    
+    def _average_metrics(self, metrics: dict) -> dict:
+        for k in metrics:
+            if k in self.non_metric_keys:
+                continue
+            metrics[k] /= self.n_folds
+        return metrics
+
+    def train(self, train_ds: Dataset, val_ds: Dataset,
+              train_sampler: Dataset, val_sampler: Dataset):
+        # ds = self._precompute(train_ds, train_sampler)
+        self.wandb_init_fun()
+        folds = self._get_folds(train_ds)
+        trainers = [self.create_trainer_fun() for i in range(len(folds))]
+        for epoch in range(1, self.num_epochs + 1):
+            metrics = None
+            for i, trainer in enumerate(trainers):
+                train_ds, val_ds = folds[i]
+                train, val = trainer._train_setup(train_ds, val_ds, train_sampler, val_sampler)
+                trainer.save_path = os.path.join(trainer.save_path, f"fold{i}")
+                new_metrics = trainer.train_one_epoch(train, val, train_sampler, val_sampler, epoch)
+                metrics = self._modify_metrics(metrics, new_metrics)
+            metrics = self._average_metrics(metrics)
+            wandb.log(metrics)
+
+    def evaluate(self, ds, sampler):
+        trainer = self.create_trainer_fun()
+        return trainer.evaluate(ds, sampler)
 
 class HyperParameterTuningTrainer(TrainerInterface):
-    def __init__(self, seed: int, n_folds: int, trainer_init: Callable[[dict], TrainerInterface],
-                 trainer_kwargs: dict, hyperparams: dict[str, Tuple[float, float, float]]):
-        pass
-    
+    def __init__(self, seed: int, n_folds: int, num_epochs: int,
+                 trainer_fun: Callable[..., TorchTrainer],
+                 sweep_config: dict):
+        self.seed = seed
+        self.n_folds = n_folds
+        self.trainer_fun = trainer_fun
+        self.num_epochs = num_epochs
+        self.sweep_config = sweep_config
+
+    def train_sweep(self, train_ds, train_sampler, val_sampler, config = None):
+        with wandb.init(config = config):
+            trainer_fun = partial(self.trainer_fun, **dict(config))
+            trainer = CrossValidationTrainer(trainer_fun, self.n_folds,
+                                             self.seed, self.num_epochs, lambda: None)
+            trainer.train(train_ds, None, train_sampler, val_sampler)
+
     def train(self, train_ds, val_ds, train_sampler, val_sampler):
-        pass
+        sweep_id = wandb.sweep(self.sweep_config)
+        print("Starting sweep for ID:", sweep_id)
+        sweep_fun = partial(self.train_sweep, train_ds = train_ds,
+                            train_sampler = train_sampler, val_sampler = val_sampler)
+        wandb.agent(sweep_id, function = sweep_fun, count = 20)
 
     def evaluate(self, ds, sampler, epoch = None):
-        pass
+        raise NotImplementedError("Evaluating does not make sense for hyperparameter tuning class")
 
 class NewVAELoss(torch.nn.Module):
     def __init__(self, lpips_weight: float):
@@ -445,7 +547,8 @@ class NewVAELoss(torch.nn.Module):
         super().train(mode)
         self.lpips_loss.eval()
         return self
-        
+
+# TODO Figure out how to average lpips and l1 over num_log_steps
 class NewVAETrainer(TorchTrainer):
     def __init__(self, num_heatmaps, **kwargs):
         super().__init__(**kwargs)
@@ -457,7 +560,10 @@ class NewVAETrainer(TorchTrainer):
             param.requires_grad = False
 
     def _load_dataloader(self, ds, sampler):
-        data = self._get_dataloader(ds, sampler)
+        # TODO Check if there is a bug that latents and images dont line up
+        # Not sure how to check but solution would be 
+        identity_sampler = SequentialSampler(ds)
+        data = self._get_dataloader(ds, identity_sampler)
         # Don't want img to be converted into TensorDataset as they are too large to fit into memory
         # Keep latents in memory and load images on the fly
         # Label isn't used for training the VAE
@@ -504,9 +610,9 @@ class NewVAETrainer(TorchTrainer):
         labels = torch.tensor(label_list)
         return images, labels
 
-    def train(self, train_ds, val_ds, train_sampler, val_sampler):
+    def _train_setup(self, train_ds, val_ds, train_sampler, val_sampler):
         self.hm_data = self._get_images_for_heatmap(val_ds)
-        return super().train(train_ds, val_ds, train_sampler, val_sampler)
+        return super()._train_setup(train_ds, val_ds, train_sampler, val_sampler)
     
     def _train_step(self, x, y, training = True):
         if not self.precompute:
@@ -517,7 +623,7 @@ class NewVAETrainer(TorchTrainer):
 
     def _calculate_heatmaps(self, images, labels):
         images = images.to(self.device)
-        new_images = self.model.decode(self.model.encode(images)).cpu()
+        new_images = self.model.decode(self.model.encode(images, sample = False)).cpu()
         new_images = torch.clamp(new_images, -1, 1)
         images = images.cpu()
         heatmaps = torch.mean(torch.abs(new_images - images), dim = 1, keepdim = True)
@@ -569,9 +675,9 @@ class VAETrainer(TorchTrainer):
         ds = MapDataset(ds, add_mask)
         return super()._load_dataloader(ds, sampler)
     
-    def train(self, train_ds, val_ds, train_sampler, val_sampler):
+    def _train_setup(self, train_ds, val_ds, train_sampler, val_sampler):
         self.hm_data = self._get_images_for_heatmap(val_ds)
-        super().train(train_ds, val_ds, train_sampler, val_sampler)
+        super()._train_setup(train_ds, val_ds, train_sampler, val_sampler)
 
     def _calculate_heatmaps(self, images, labels):
         images = images.to(self.device)

@@ -40,7 +40,7 @@ def main(cfg: DictConfig):
     wandb_config = OmegaConf.to_container(
         cfg, resolve=True, throw_on_missing=True
     )
-    wandb.init(project = cfg.project_name, config = wandb_config)
+    # TODO move to TorchTrainer
     data_module = instantiate(cfg.data.data_module)
     datasets = data_module.load_datasets()
     train, val, test, real = datasets
@@ -52,7 +52,9 @@ def main(cfg: DictConfig):
     print(f"Validation set size: {len(val)}")
     print(f"Test set size: {len(test)}")
     print(f"Real set size: {len(real)}")
-    trainer = instantiate(cfg.model.trainer)
+    def wandb_init_fun():
+        return wandb.init(project = cfg.project_name, config = wandb_config)
+    trainer = instantiate(cfg.model.trainer, wandb_init_fun = wandb_init_fun)
     trainer.train(train, val, train_sampler, val_sampler)
 
 if __name__ == "__main__":

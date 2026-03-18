@@ -77,5 +77,6 @@ trainer:
   calculate_metrics: true
   seed: "${seed}"
   num_save_epochs: 5
-  save_path: "models/mobilenet_v2"
+  save_path: "models/mobilenet_v2
+  steps_per_log: 50
 

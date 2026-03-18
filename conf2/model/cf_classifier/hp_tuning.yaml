@@ -1,0 +1,89 @@
+model:
+  _target_: src.model.CounterfactualTorchClassifier
+  # Currently no other args
+
+data:
+  rec_split: true
+  split_index: 1
+  new_index: 0
+  rec_ratio: 1.0
+  # TODO maybe want to undersample so that class proportions are equal?
+  n_sample: [null, null, null, null]
+  oversample: false
+  # no augmentations as we are using the diffusion model for inference
+
+threshold: 0.5
+class_names:
+  - "NRG"
+  - "RG"
+metrics:
+  # Used custom resolver specified in main.py
+  # Usage: ${metric:[sklearn metric name or function path], threshold, switch_args, is_wandb, kwargs}
+  accuracy: ${metric:accuracy_score, ${..threshold}}
+  balanced_accuracy: ${metric:balanced_accuracy_score, ${..threshold}}
+  precision: ${metric:precision_score, ${..threshold}}
+  recall: ${metric:recall_score, ${..threshold}}
+  f1_score: ${metric:f1_score, ${..threshold}}
+  roc_auc: ${metric:roc_auc_score}
+  roc_curve: ${metric:wandb.plot.roc_curve, null, false, true, {labels:${..class_names}}}
+  pr_curve: ${metric:wandb.plot.pr_curve, null, false, true, {labels:${..class_names}}}
+  confusion_matrix: ${metric:wandb.plot.confusion_matrix, null, true, true, {class_names:${..class_names}}}
+
+trainer:
+  _target_: src.train.HyperparameterTuningTrainer
+  _convert_: partial
+  seed: ${seed}
+  n_folds: 5
+  num_epochs: 20
+  sweep_config:
+    method: bayes
+    metric:
+      name: val_f1_score
+      goal: maximize
+    early_terminate:
+      type: hyperband
+      min_iter: 4
+      eta: 3
+    parameters:
+      num_inference_steps:
+        distribution: int_uniform
+        min: 10
+        max: 100
+      guidance_scale:
+        distribution: uniform
+        min: 1.0
+        max: 7.5
+      percent_steps:
+        distribution: uniform
+        min: 0.1
+        max: 1.0
+      use_dn:
+        values: [false, true]
+    trainer_fun:
+      target: src.train.CounterfactualTorchClassifier
+      _partial_: true
+      model: ${model.model}
+      diffusion_model:
+        _target_: src.model.LatentDiffusionModel.load
+        save_path: models/q5bbm6s4/060/
+      inference_hyperparams: ${inference}
+      optimizer_fun:
+        _target_: src.utils.get_optimizer
+        optimizer_init:
+          _target_: torch.optim.AdamW
+          _partial_: true
+        lr: 1e-4
+        weight_decay: 0.01
+      loss:
+        _target_: torch.nn.BCEWithLogitsLoss
+      num_epochs: ${model.trainer.num_epochs}
+      batch_size: 32
+      num_workers: 4
+      mixed_precision: "bf16"
+      precompute: true
+      metrics: "${model.metrics}"
+      calculate_metrics: true
+      seed: "${seed}"
+      num_save_epochs: 5
+      save_path: "models/mobilenet_v2"
+      steps_per_log: 50

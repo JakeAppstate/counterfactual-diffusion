@@ -11,7 +11,7 @@ data:
   split_index: 0
   new_index: 0 # Use training split as new training set
   rec_ratio: 0.8
-  n_sample: [20000, null, null, null]
+  n_sample: [10000, null, null, null]
   augmentations:
     _target_: ${const.v2}.Compose
     transforms:
@@ -40,6 +40,7 @@ trainer:
   num_save_epochs: 5
   calculate_metrics: false
   metrics: {}
+  steps_per_log: 50
   precompute: true
   save_path: models/vae
   num_heatmaps: 8

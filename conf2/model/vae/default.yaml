@@ -44,3 +44,4 @@ trainer:
   precompute: false
   save_path: models/vae
   num_heatmaps: 8
+  steps_per_log: 50
