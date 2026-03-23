@@ -6,9 +6,9 @@ data:
   rec_split: true
   split_index: 1
   new_index: 0
-  rec_ratio: 1.0
+  rec_ratio: 0.0
   # TODO maybe want to undersample so that class proportions are equal?
-  n_sample: [null, null, null, null]
+  n_sample: null
   oversample: false
   # no augmentations as we are using the diffusion model for inference
 
@@ -30,11 +30,12 @@ metrics:
   confusion_matrix: ${metric:wandb.plot.confusion_matrix, null, true, true, {class_names:${..class_names}}}
 
 trainer:
-  _target_: src.train.HyperparameterTuningTrainer
+  _target_: src.train.HyperParameterTuningTrainer
   _convert_: partial
   seed: ${seed}
   n_folds: 5
   num_epochs: 20
+  project_name: ${project_name}
   sweep_config:
     method: bayes
     metric:
@@ -59,31 +60,31 @@ trainer:
         max: 1.0
       use_dn:
         values: [false, true]
-    trainer_fun:
-      target: src.train.CounterfactualTorchClassifier
-      _partial_: true
-      model: ${model.model}
-      diffusion_model:
-        _target_: src.model.LatentDiffusionModel.load
-        save_path: models/q5bbm6s4/060/
-      inference_hyperparams: ${inference}
-      optimizer_fun:
-        _target_: src.utils.get_optimizer
-        optimizer_init:
-          _target_: torch.optim.AdamW
-          _partial_: true
-        lr: 1e-4
-        weight_decay: 0.01
-      loss:
-        _target_: torch.nn.BCEWithLogitsLoss
-      num_epochs: ${model.trainer.num_epochs}
-      batch_size: 32
-      num_workers: 4
-      mixed_precision: "bf16"
-      precompute: true
-      metrics: "${model.metrics}"
-      calculate_metrics: true
-      seed: "${seed}"
-      num_save_epochs: 5
-      save_path: "models/mobilenet_v2"
-      steps_per_log: 50
+  trainer_fun:
+    _target_: src.train.CounterfactualTorchTrainer
+    _partial_: true
+    model: ${model.model}
+    diffusion_model:
+      _target_: src.model.LatentDiffusionModel.load
+      save_path: models/diffusion/q5bbm6s4/
+    inference_hyperparams: ${inference}
+    optimizer_fun:
+      _target_: src.utils.get_optimizer
+      optimizer_init:
+        _target_: torch.optim.AdamW
+        _partial_: true
+      lr: 1e-4
+      weight_decay: 0.01
+    loss:
+      _target_: torch.nn.BCEWithLogitsLoss
+    num_epochs: ${model.trainer.num_epochs}
+    batch_size: 32
+    num_workers: 4
+    mixed_precision: "bf16"
+    precompute: true
+    metrics: "${model.metrics}"
+    calculate_metrics: true
+    seed: "${seed}"
+    num_save_epochs: 5
+    save_path: "models/mobilenet_v2"
+    steps_per_log: 50

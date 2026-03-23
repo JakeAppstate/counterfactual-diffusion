@@ -36,14 +36,15 @@ OmegaConf.register_new_resolver("metric", get_metric_yaml)
 @hydra.main(config_path="../conf2", config_name="config", version_base=None)
 def main(cfg: DictConfig):
     torch.manual_seed(cfg.seed)
+    torch.cuda.empty_cache()
     # TODO add tags to init e.g. diffusion vs vae vs cf_classifier
     wandb_config = OmegaConf.to_container(
         cfg, resolve=True, throw_on_missing=True
     )
-    # TODO move to TorchTrainer
     data_module = instantiate(cfg.data.data_module)
     datasets = data_module.load_datasets()
     train, val, test, real = datasets
+    # Not sure why use_generator is false for for train_sampler
     train_sampler = data_module.get_sampler(train, oversample = cfg.data.oversample)
     val_sampler = data_module.get_sampler(val, oversample = False,
                                           replacement = False, use_generator = True)

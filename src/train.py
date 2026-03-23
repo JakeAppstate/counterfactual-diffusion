@@ -14,13 +14,13 @@ from sklearn.metrics import accuracy_score, balanced_accuracy_score, roc_auc_sco
                             f1_score, precision_score, recall_score
 from diffusers import DDPMScheduler, DDIMScheduler, EMAModel
 import wandb
-from torch.utils.data import Dataset, TensorDataset, DataLoader, Sampler, SequentialSampler, Subset
+from torch.utils.data import Dataset, TensorDataset, DataLoader, Sampler, RandomSampler, WeightedRandomSampler, SequentialSampler, Subset
 import torch
 from tqdm import tqdm
 
 import src.model
 from src.utils import create_grid, create_counterfactual_grid
-from src.data import MapDataset, ZippedDataset
+from src.data import BaseDataset, MapDataset, ZippedDataset
 
 # Custom Types
 Metrics = Dict[str, Callable[[float, float], float]]
@@ -430,16 +430,37 @@ class CrossValidationTrainer(TrainerInterface):
         self.seed = seed
         self.num_epochs = num_epochs
         self.wandb_init_fun = wandb_init_fun
-        self.non_metric_keys = ["epoch", "global_step"]
+        # loss is logged every 50 epochs
+        # avg_loss would make more sense to average across folds
+        self.non_metric_keys = ["loss", "epoch", "global_step"]
 
-    def _get_folds(self, ds):
+    def _get_sampler(self, sampler: Sampler, ds: Subset):
+        if isinstance(sampler, SequentialSampler):
+            sampler = SequentialSampler(ds)
+        elif isinstance(sampler, RandomSampler):
+            sampler = RandomSampler(ds, sampler.replacement, generator = sampler.generator)
+        elif isinstance(sampler, WeightedRandomSampler):
+            idx = torch.tensor(ds.indicies)
+            weights = sampler.weights[idx]
+            sampler = WeightedRandomSampler(weights, replacement = sampler.replacement,
+                                            generator = sampler.generator)
+        else:
+            raise TypeError(f"Sampler type {type(sampler)} is not supported")
+        return sampler
+
+    def _get_folds(self, ds: Dataset):
         trainer = self.create_trainer_fun()
         ds = self._precompute(ds, trainer)
         # Calculate fold indicies and get subsets
         folds = []
-        y = ds.get_targets()
+        if isinstance(ds, BaseDataset):
+            y = ds.get_targets()
+        elif isinstance(ds, TensorDataset):
+            y = ds.tensors[1].numpy()
+        else:
+            raise RuntimeError("Can't currently get targets on dataset other than BaseDataset or TensorDataset")
         X = np.zeros_like(y)
-        strat_kfold = sklearn.model_selection.StratifiedKFold(n_splits=self.n_folds,
+        strat_kfold = sklearn.model_selection.StratifiedKFold(n_splits=self.n_folds, shuffle = True,
                                                               random_state = self.seed)
         for train_idx, val_idx in strat_kfold.split(X, y):
             train = Subset(ds, train_idx)
@@ -460,6 +481,8 @@ class CrossValidationTrainer(TrainerInterface):
         return new_ds
 
     def _modify_metrics(self, metrics: dict, new_metrics: dict) -> dict:
+        new_metrics = {k: v for k, v in new_metrics.items()
+                       if isinstance(v, float) or isinstance(v, int)}
         if metrics is None:
             return new_metrics
         for k in metrics:
@@ -484,10 +507,13 @@ class CrossValidationTrainer(TrainerInterface):
         for epoch in range(1, self.num_epochs + 1):
             metrics = None
             for i, trainer in enumerate(trainers):
+                trainer.precompute = False
                 train_ds, val_ds = folds[i]
-                train, val = trainer._train_setup(train_ds, val_ds, train_sampler, val_sampler)
+                fold_train_sampler = self._get_sampler(train_sampler, train_ds)
+                fold_val_sampler = self._get_sampler(val_sampler, val_ds)
+                train, val = trainer._train_setup(train_ds, val_ds, fold_train_sampler, fold_val_sampler)
                 trainer.save_path = os.path.join(trainer.save_path, f"fold{i}")
-                new_metrics = trainer.train_one_epoch(train, val, train_sampler, val_sampler, epoch)
+                new_metrics = trainer.train_one_epoch(train, val, epoch)
                 metrics = self._modify_metrics(metrics, new_metrics)
             metrics = self._average_metrics(metrics)
             wandb.log(metrics)
@@ -499,22 +525,28 @@ class CrossValidationTrainer(TrainerInterface):
 class HyperParameterTuningTrainer(TrainerInterface):
     def __init__(self, seed: int, n_folds: int, num_epochs: int,
                  trainer_fun: Callable[..., TorchTrainer],
-                 sweep_config: dict):
+                 project_name: str,
+                 sweep_config: dict, wandb_init_fun):
         self.seed = seed
         self.n_folds = n_folds
         self.trainer_fun = trainer_fun
         self.num_epochs = num_epochs
         self.sweep_config = sweep_config
+        self.project_name = project_name
+        self.wandb_init_fun = wandb_init_fun
 
-    def train_sweep(self, train_ds, train_sampler, val_sampler, config = None):
-        with wandb.init(config = config):
-            trainer_fun = partial(self.trainer_fun, **dict(config))
+    def train_sweep(self, train_ds, train_sampler, val_sampler):
+        with self.wandb_init_fun():
+            hyperparams = {k: v for k, v in dict(wandb.config).items()
+                           if k in self.sweep_config["parameters"]}
+            # TODO modify CFTrainer to take hyperparams directly with dict unpacking
+            trainer_fun = partial(self.trainer_fun, inference_hyperparams = hyperparams)
             trainer = CrossValidationTrainer(trainer_fun, self.n_folds,
                                              self.seed, self.num_epochs, lambda: None)
             trainer.train(train_ds, None, train_sampler, val_sampler)
 
     def train(self, train_ds, val_ds, train_sampler, val_sampler):
-        sweep_id = wandb.sweep(self.sweep_config)
+        sweep_id = wandb.sweep(self.sweep_config, project=self.project_name)
         print("Starting sweep for ID:", sweep_id)
         sweep_fun = partial(self.train_sweep, train_ds = train_ds,
                             train_sampler = train_sampler, val_sampler = val_sampler)

@@ -11,7 +11,7 @@ data:
   split_index: 0
   new_index: 0 # Use training split as new training set
   rec_ratio: 0.8
-  n_sample: [10000, null, null, null]
+  n_sample: [20000, null, null, null]
   augmentations:
     _target_: ${const.v2}.Compose
     transforms:

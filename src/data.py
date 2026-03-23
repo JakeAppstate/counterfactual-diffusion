@@ -238,7 +238,8 @@ class DataModule:
         if self.rec_split:
             df = dataframes[self.split_index]
             new_df = self._split_dataframes(df, self.rec_ratio, 0, False)[self.new_index]
-            dataframes[self.split_index] = new_df
+            # TODO verfify that this makes sense
+            dataframes[self.new_index] = new_df
 
         # Get subset of datasets id needed
         if self.n_sample is not None:

@@ -64,11 +64,11 @@ class ClassEmbedder(nn.Module, ModelInterface):
     @classmethod
     def load(cls, save_path: str) -> ClassEmbedder:
         # can raise file not found error
-        with open(os.path.join(save_path), "r", encoding="utf-8") as file:
+        with open(os.path.join(save_path, "model_args.json"), "r", encoding="utf-8") as file:
             args = json.load(file)
         
         model = cls(**args)
-        model.load_state_dict(torch.load(os.path.join("model.pt")))
+        model.load_state_dict(torch.load(os.path.join(save_path, "model.pt")))
         model.load_path = save_path
         return model
 
@@ -290,6 +290,7 @@ class LatentDiffusionModel(nn.Module, ModelInterface):
         return images, new_images, heatmap
 
     def save(self, save_path):
+        # TODO modify save code to match load code
         # if model is already saved then create a link to saved model to save storage
         if self.load_path is not None:
             os.symlink(self.load_path, save_path)
