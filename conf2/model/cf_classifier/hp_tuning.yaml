@@ -34,7 +34,7 @@ trainer:
   _convert_: partial
   seed: ${seed}
   n_folds: 5
-  num_epochs: 20
+  num_epochs: 50
   project_name: ${project_name}
   sweep_config:
     method: bayes
@@ -60,13 +60,15 @@ trainer:
         max: 1.0
       use_dn:
         values: [false, true]
+      encode_base:
+        values: [false, true]
   trainer_fun:
     _target_: src.train.CounterfactualTorchTrainer
     _partial_: true
     model: ${model.model}
     diffusion_model:
       _target_: src.model.LatentDiffusionModel.load
-      save_path: models/diffusion/q5bbm6s4/
+      save_path: models/diffusion/q93rmiop/75
     inference_hyperparams: ${inference}
     optimizer_fun:
       _target_: src.utils.get_optimizer

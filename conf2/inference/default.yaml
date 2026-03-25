@@ -1,4 +1,5 @@
-num_inference_steps: 100
+num_inference_steps: 50
 guidance_scale: 3.0
-percent_steps: 0.3
-use_dn: true
+percent_steps: 1.0
+use_dn: false
+encode_base: true

@@ -55,6 +55,7 @@ class ClassEmbedder(nn.Module, ModelInterface):
         if self.load_path is not None:
             os.symlink(self.load_path, save_path)
             return
+        os.makedirs(save_path, exist_ok=True)
         with open(os.path.join(save_path, "model_args.json"), "w", encoding="utf-8") as file:
             data = {"num_classes": self.num_classes, "emb_dim": self.emb_dim}
             json.dump(data, file, indent=4)
@@ -134,6 +135,7 @@ class VAE(nn.Module, ModelInterface):
         if self.load_path is not None:
             os.symlink(self.load_path, save_path)
             return
+        os.makedirs(save_path, exist_ok=True)
         self.vae.save_pretrained(save_path)
 
     @classmethod
@@ -244,7 +246,7 @@ class LatentDiffusionModel(nn.Module, ModelInterface):
     @torch.no_grad
     def get_counterfactual(self, images, num_inference_steps, guidance_scale = 3.0,
                            percent_steps = 1.0, use_dn = True, rescale = False,
-                           log = False):
+                           encode_base = False, log = False):
         # Get forward and reverse scheduler
         reverse_scheduler = DDIMInverseScheduler.from_config(self.scheduler.config)
         forward_scheduler = self.scheduler
@@ -257,7 +259,9 @@ class LatentDiffusionModel(nn.Module, ModelInterface):
 
         images = images.to(self.vae.device)
         latents = self.vae.encode(images, sample = False)
-        images = images.cpu() # remove images from gpu to save vram
+        # pass images through vae to remove reconstruction error and move to cpu
+        # to reduce VRAM useage
+        images = self.vae.decode(latents).cpu() if encode_base else images.cpu()
         latents = latents.to(device, dtype = self.unet.dtype)
         # latents = latents.to(self.unet.dtype)
         # Backwards Process: x_0 -> x_T
@@ -295,8 +299,11 @@ class LatentDiffusionModel(nn.Module, ModelInterface):
         if self.load_path is not None:
             os.symlink(self.load_path, save_path)
             return
-        self.unet.save_pretrained(save_path)
-        self.class_embedder.save(save_path)
+        os.makedirs(save_path, exist_ok=True)
+        self.unet.save_pretrained(os.path.join(save_path, "unet"))
+        self.class_embedder.save(os.path.join(save_path, "class_embedder"))
+        self.vae = self.vae.save(os.path.join(save_path, "vae"))
+        self.scheduler.save_pretrained(os.path.join(save_path, "scheduler"))
 
     def train(self, mode: bool = True):
         super().train(mode)

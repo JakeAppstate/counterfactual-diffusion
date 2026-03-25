@@ -1,0 +1,94 @@
+# model
+model:
+  _target_: src.model.LatentDiffusionModel
+  vae:
+    _target_: src.model.VAE.load
+    save_path: "models/vae/67ckcnol/80"
+  class_embedder:
+    _target_: src.model.ClassEmbedder
+    num_classes: 2
+    emb_dim: ${..unet.cross_attention_dim}
+  unet:
+    _target_: diffusers.UNet2DConditionModel
+    _convert_: partial
+    sample_size: 64
+    in_channels: 4
+    out_channels: 4
+    cross_attention_dim: 512
+    class_embed_type: null
+    layers_per_block: 2
+    block_out_channels: [128, 256, 512, 512]
+    down_block_types: [
+      "DownBlock2D",
+      "DownBlock2D",
+      "CrossAttnDownBlock2D",
+      "CrossAttnDownBlock2D",
+    ]
+    up_block_types: [
+      "CrossAttnUpBlock2D",
+      "CrossAttnUpBlock2D",
+      "UpBlock2D",
+      "UpBlock2D",
+    ]
+  scheduler:
+    _target_: diffusers.DDIMScheduler
+    num_train_timesteps: 1000
+    # from StableDiffusion which what the architecture is based on
+    beta_start: 0.00085
+    beta_end: 0.012
+    beta_schedule: "scaled_linear"
+    clip_sample: false
+    prediction_type: "epsilon"
+
+data:
+  rec_split: false
+  # Do not want to split the data recursively, if it does occur, using a value of 100 should throw an error
+  split_index: 100
+  rec_ratio: 0
+  n_sample: [20000, null, null, null]
+  # augmentations:
+  #   _target_: ${const.v2}.Compose
+  #   transforms:
+  #     - _target_: ${const.v2}.RandomHorizontalFlip
+  #       p: 0.5
+  #     - _target_: ${const.v2}.ColorJitter
+  #       brightness: 0.1
+  #       contrast: 0.1
+  #       saturation: 0.1
+  #       hue: 0
+
+trainer:
+  _target_: src.train.DiffusionTrainer
+  _convert_: partial
+  model: ${model.model}
+  num_epochs: 100
+  optimizer_fun:
+    _target_: src.utils.get_optimizer
+    optimizer_init: 
+      _target_: torch.optim.AdamW
+      _partial_: true
+    weight_decay: 0.01
+    lr: 1e-4
+    # can add parameter groups using param_groups key
+    # Use ENUM for name field
+  loss:
+    _target_: torch.nn.MSELoss
+  batch_size: 32
+  num_workers: 4
+  mixed_precision: "bf16"
+  seed: ${seed}
+  num_save_epochs: 5
+  save_path: "models/diffusion"
+  calculate_metrics: false
+  metrics: {}
+  precompute: true
+  p_label_dropout: 0.3
+  ema_decay: 0.999
+  steps_per_log: 50
+  num_inference_steps: ${inference.num_inference_steps}
+  guidance_scale: ${inference.guidance_scale}
+  percent_steps: ${inference.percent_steps}
+  use_dn: ${inference.use_dn}
+  encode_base: ${inference.encode_base}
+  num_generate: 3 # 3 per label (including null)
+  num_counterfactual: 8 # 8 per class

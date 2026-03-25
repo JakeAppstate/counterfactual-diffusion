@@ -104,13 +104,16 @@ class TorchTrainer(TrainerInterface):
             ds = self._precompute(data) or ds
         data = self._get_dataloader(ds, sampler)
         return data
-    
+
+    def _get_optimizer(self):
+        return self.optimizer_fun(self.model.parameters())
+
     def _train_setup(self, train_ds: Dataset, val_ds: Dataset, train_sampler: Sampler,
                      val_sampler: Sampler) -> Tuple[DataLoader, DataLoader]:
         self.model.train()
         self.model.to(self.device)
         self.loss.train()
-        self.optimizer = self.optimizer_fun(self.model.parameters())
+        self.optimizer = self._get_optimizer()
         train = self._load_dataloader(train_ds, train_sampler)
         val = self._load_dataloader(val_ds, val_sampler)
         self.global_step = 0
@@ -165,6 +168,11 @@ class TorchTrainer(TrainerInterface):
         metrics = metrics | self._evaluate(val, epoch)
         return metrics
 
+    def _save_model(self, epoch):
+        save_path = os.path.join(self.save_path, wandb.run.id, str(epoch))
+        os.makedirs(save_path, exist_ok=True)
+        self.model.save(save_path)
+    
     def train(self, train_ds: Dataset, val_ds: Dataset,
               train_sampler: Sampler, val_sampler: Sampler):
         train, val = self._train_setup(train_ds, val_ds, train_sampler, val_sampler)
@@ -173,9 +181,8 @@ class TorchTrainer(TrainerInterface):
             metrics = self.train_one_epoch(train, val, epoch)
             wandb.log(metrics)
             if epoch % self.num_save_epochs == 0:
-                save_path = os.path.join(self.save_path, wandb.run.id, str(epoch))
-                os.makedirs(save_path, exist_ok=True)
-                self.model.save(save_path)
+                self._save_model(epoch)
+                
 
     def _train_step(self, x: Tuple[torch.Tensor, ...], y: torch.Tensor, training: bool = True) -> TrainStepReturn:
         self.optimizer.zero_grad(set_to_none = True)
@@ -249,7 +256,8 @@ class TorchTrainer(TrainerInterface):
 class DiffusionTrainer(TorchTrainer):
     def __init__(self, p_label_dropout: float, num_inference_steps: int,
                  ema_decay: float, num_generate: int, num_counterfactual: int,
-                 guidance_scale: float, use_dn: bool, percent_steps: float, **kwargs):
+                 guidance_scale: float, use_dn: bool, percent_steps: float,
+                 encode_base: bool, **kwargs):
         # Metrics are not supported as storing predictions would use too much memory
         # Also, there are not any metrics that use only one diffusion step
         assert not kwargs["metrics"], "No metrics should be used for training diffusion model as \
@@ -260,24 +268,23 @@ class DiffusionTrainer(TorchTrainer):
         self.num_inference_steps = num_inference_steps
         self.num_generate = num_generate
         self.num_counterfactual = num_counterfactual
+        self.ema_decay = ema_decay
         # TODO may want to bundle into inference dict and unpack when calling model
         self.guidance_scale = guidance_scale
         self.use_dn = use_dn
         self.percent_steps = percent_steps
+        self.encode_base = encode_base
         self.scheduler = DDPMScheduler.from_config(self.model.scheduler.config)
         self.cf_data = None
 
-        self.ema_model = EMAModel(
-            self.model.unet.parameters(),
-            decay = ema_decay,
-            model_cls = type(self.model.unet),
-            model_config = self.model.unet.config
-        )
+        self.ema_model = None
+
+    def _get_optmizer(self):
         params = [
             (ParameterGroupNames.CLASS_EMBEDDER.value, self.model.class_embedder.parameters()),
             (ParameterGroupNames.UNET.value, self.model.unet.parameters())
         ]
-        self.optimizer_fun= lambda *args : self.optimizer_fun(params=params)
+        return self.optimizer_fun(params = params)
 
     @torch.no_grad()
     def _precompute(self, dataloader: DataLoader) -> Dataset:
@@ -306,7 +313,14 @@ class DiffusionTrainer(TorchTrainer):
     
     def _train_setup(self, train_ds, val_ds, train_sampler, val_sampler):
         self.cf_data = self._get_counterfactual_dataset(val_ds)
-        super()._train_setup(train_ds, val_ds, train_sampler, val_sampler)
+        self.ema_model = EMAModel(
+            self.model.unet.parameters(),
+            decay = self.ema_decay,
+            model_cls = type(self.model.unet),
+            model_config = self.model.unet.config
+        )
+        self.ema_model.to(self.device)
+        return super()._train_setup(train_ds, val_ds, train_sampler, val_sampler)
 
     def _train_step(self, x, y, training = True):
         # Device locations should be okay for training
@@ -322,6 +336,7 @@ class DiffusionTrainer(TorchTrainer):
             y = y.masked_fill(drop_mask, self.model.class_embedder.null_class_label)
         loss, _, _ = super()._train_step((noisy_latents, timesteps, y), noise, training)
         # Don't want to save target and prediction as they are full sized images
+        self.ema_model.step(self.model.unet.parameters())
         return loss, None, None
     
     def _generate_images(self):
@@ -359,27 +374,43 @@ class DiffusionTrainer(TorchTrainer):
                                                         guidance_scale = self.guidance_scale,
                                                         percent_steps = self.percent_steps,
                                                         use_dn = self.use_dn, rescale = True,
-                                                        log = True)
+                                                        encode_base = self.encode_base, log = True)
         orig, new, heatmap = (x.cpu().permute(0, 2, 3, 1).numpy() for x in counterfactuals)
         fig = create_counterfactual_grid(orig, new, heatmap, labels)
         return fig
     
+    def _save_model(self, epoch):
+        if self.ema_model is not None:
+            self.ema_model.store(self.model.unet.parameters())
+            self.ema_model.copy_to(self.model.unet.parameters())
+            super()._save_model(epoch)
+            self.ema_model.restore(self.model.unet.parameters())
+        else:
+            super()._save_model(epoch)
+
+    
+    @torch.no_grad()
     def _evaluate(self, dataloader: DataLoader, epoch: int):
-        super()._evaluate(dataloader, epoch)
+        if self.ema_model is not None:
+            # move ema weights to unet for evaluation
+            self.ema_model.store(self.model.unet.parameters())
+            self.ema_model.copy_to(self.model.unet.parameters())
+        metrics = super()._evaluate(dataloader, epoch)
         if epoch % self.num_save_epochs == 0 or epoch == self.num_epochs or epoch == 1:
             if self.precompute:
                 self.model.vae.to(self.device)
             gen_fig = self._generate_images()
             cf_fig = self._get_counterfactuals(self.cf_data)
-            wandb.log({
-                "epoch": epoch,
-                "Generated Images": wandb.Image(gen_fig),
-                "Counterfactual Images": wandb.Image(cf_fig)
-            })
+            metrics["Generated Images"] = wandb.Image(gen_fig)
+            metrics["Counterfactual Images"] = wandb.Image(cf_fig)
             plt.close()
             if self.precompute:
                 self.model.vae.to("cpu")
                 torch.cuda.empty_cache()
+        if self.ema_model is not None:
+            # move ema weights to unet for evaluation
+            self.ema_model.restore(self.model.unet.parameters())
+        return metrics
 
 class CounterfactualTorchTrainer(TorchTrainer):
     def __init__(self, diffusion_model: src.model.LatentDiffusionModel, inference_hyperparams: dict, **kwargs):
